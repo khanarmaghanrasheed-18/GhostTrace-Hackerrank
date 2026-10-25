@@ -578,3 +578,27 @@ branch=work
 repo_root=/home/user/GhostTrace-Hackerrank
 worktree=main
 parent_agent=none
+
+## [2026-10-25T14:40:35Z] Poppler found only inside the Codex runtime folder; install a full copy
+
+User Prompt (verbatim, secrets redacted):
+PS C:\Armaghan\PYTHON\HACKATHONS\GhostTrace-Hackerrank> cd C:\Armaghan\PYTHON\HACKATHONS\GhostTrace-Hackerrank
+PS C:\Armaghan\PYTHON\HACKATHONS\GhostTrace-Hackerrank> py -c "import shutil; print('tesseract:', shutil.which('tesseract')); print('pdftotext:', shutil.which('pdftotext')); print('pdftoppm :', shutil.which('pdftoppm'))"
+tesseract: C:\Program Files\Tesseract-OCR\tesseract.EXE
+pdftotext: None
+pdftoppm : C:\Users\DELL 7400\.cache\codex-runtimes\codex-primary-runtime\dependencies\native\poppler\Library\bin\pdftoppm.EXE
+PS C:\Armaghan\PYTHON\HACKATHONS\GhostTrace-Hackerrank>
+
+Agent Response Summary:
+Tesseract is now found. The pdftoppm on PATH belongs to a partial Poppler copy bundled inside the Codex app's runtime folder, which has no pdftotext and may change when Codex updates. GhostTrace needs pdftotext for every PDF, so I recommended installing a full Poppler with winget, putting its folder on PATH in place of the Codex runtime entry, and re-checking. A command to list that folder's tools was included. No code was changed.
+
+Actions:
+* Answered with PowerShell commands; appended this entry to log.txt
+
+Context:
+tool=Claude Code
+model=claude-opus-5-5
+branch=work
+repo_root=/home/user/GhostTrace-Hackerrank
+worktree=main
+parent_agent=none
