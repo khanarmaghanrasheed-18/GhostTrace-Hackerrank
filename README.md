@@ -155,3 +155,23 @@ Before submitting, confirm that:
 - `code.zip` includes your runnable code, `README.md`, `code/evaluation/evaluation_report.md`, and `code/evaluation/usage_report.md`;
 - `log.txt` follows the `AGENTS.md` turn format and is uploaded to the `chat_transcript` slot; and
 - no API keys, credentials, real personal data, or sensitive configuration values are included.
+
+## GhostTrace implementation status
+
+The current Python core engine is an **evaluation build**, not a finished submission. It reads only participant-facing `dataset/` files. It uses Python's standard library, plus the `pdftotext`, `pdftoppm`, and `tesseract` executables for document extraction. These tools are installed in the current cloud environment; no Python package installation is required for this build. From the repository root:
+
+```bash
+python3 --version
+command -v pdftotext pdftoppm tesseract
+python3 code/main.py run
+python3 code/main.py validate
+python3 code/main.py inspect case_05 --input dataset/sample_deletion_requests.csv
+python3 code/evaluation/main.py
+python3 -m unittest discover -s code/evaluation -p 'test_*.py' -v
+```
+
+`run` writes the root-level `output.csv`; `dataset/output.csv` remains the blank template. Extraction results are cached under ignored `.cache/ghosttrace/`. `inspect` prints the case's prediction and observation provenance. The sample evaluator reads expected answers only after prediction; the audit engine never imports `sample_output.csv`.
+
+Gemini is optional and reserved for ambiguous request language and review hints on difficult extracted text. The engine reads `GEMINI_API_KEY` from the environment, never from source or `.env` files, and limits uncached calls with `GEMINI_MAX_CALLS` (default 20). Run `python3 code/main.py gemini-check` for one minimal live check only after the key and network destination are configured. In the current cloud environment there is no key binding and the Gemini host was denied by the proxy, so no live model call has been made.
+
+The most recent public-sample evaluation matched 27 of 32 statuses and exactly matched all steps for 5 of 32 cases. The generated 518-row CSV passes structural validation, but some authorized requests lack enough linked evidence for a supported decision. Treat `output.csv` as provisional; see [`docs/PLAN.md`](./docs/PLAN.md) and [`code/evaluation/evaluation_report.md`](./code/evaluation/evaluation_report.md) before using it for submission.
