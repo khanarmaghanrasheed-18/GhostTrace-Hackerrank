@@ -530,3 +530,22 @@ branch=work
 repo_root=/home/user/GhostTrace-Hackerrank
 worktree=main
 parent_agent=none
+
+## [2026-10-25T14:29:46Z] Commands to locate, verify and install tesseract and poppler
+
+User Prompt (verbatim, secrets redacted):
+Give me terminal commands to download and install tesseract but before that i already installed both so give me a command to check, i couldnt find them before
+
+Agent Response Summary:
+Gave commands to check whether tesseract and poppler (pdftotext/pdftoppm) are on PATH, including a Python one-liner that shows exactly what GhostTrace will find. For Windows, which earlier context suggests the user is on, gave PowerShell commands to search the usual install folders, add the found folders to the user PATH, and install with winget if they are missing; brief macOS and Linux equivalents were included. No code was changed.
+
+Actions:
+* Answered with OS-specific commands; appended this entry to log.txt
+
+Context:
+tool=Claude Code
+model=claude-opus-5-5
+branch=work
+repo_root=/home/user/GhostTrace-Hackerrank
+worktree=main
+parent_agent=none
