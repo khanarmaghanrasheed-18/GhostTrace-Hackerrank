@@ -1,373 +1,554 @@
-"""Time-aware identity, evidence and policy decisions for the challenge."""
+"""Time-aware identity, evidence and policy decisions for each deletion request.
+
+The engine works in four steps for a case:
+1. decide whether the request authorizes deletion;
+2. find every resource that belongs to the person (the ownership graph);
+3. reconstruct each resource's state in each store at audit_at;
+4. apply the supplied rule for its data category and write the steps.
+"""
 
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import datetime, timedelta
 import json
 from pathlib import Path
 import re
 from typing import Any
 
 from .gemini import GeminiInterpreter
-from .ingest import EvidenceIndex, Observation, flatten_values, iso_at, read_csv
+from .graph import EvidenceGraph
+from .identity import IdentityIndex
+from .ingest import (EMAIL, PHONE, RESOURCE, EvidenceIndex, Observation, default_category,
+                     default_system, iso_at, normalize, read_csv)
 from .validate import OPERATIONS, PHASE_ORDER
 
 
-EMAIL = re.compile(r"[\w.+-]+@[\w.-]+\.[a-z]{2,}", re.I)
-DELETE_INTENT = re.compile(
-    r"\b(delet(?:e|ion|ed|ing)?|eras(?:e|ure|ed)|remov(?:e|al|ed)|"
-    r"clos(?:e|ed|ing) (?:my |the |this )?account|account clos(?:e|ure)|right to be forgotten|"
-    r"suppression|supprim\w*|effac\w*|elimin\w*|borrar|eliminar|gel[oö]scht|l[oö]schen|"
-    r"delete my data|forget me|profile (?:is |was )?gone|account (?:is |was )?gone|"
-    r"confirm (?:that )?(?:my |the )?(?:profile|account) (?:is |was )?gone)\b|削除|消去|탈퇴|삭제|删除", re.I)
-DENIAL = re.compile(r"\b(do not|don't|not|never|no)\s+(?:want\s+(?:you\s+to\s+)?|ask(?:ing)?\s+(?:you\s+to\s+)?)?"
-                    r"(?:delete|erase|remove|close)\b", re.I)
-NONDELETE = re.compile(r"\b(access|download|export|correct|update|opt[ -]?out|unsubscribe|"
-                       r"marketing preferences|copy of my data)\b", re.I)
-PII_KEYS = {"email", "phone", "email_hash", "full_name", "name", "display_name",
-            "requester_email", "requester_phone", "requester_name", "customer_email",
-            "owner_email", "owner_phone"}
-NEGATIVE = {"NOT_FOUND", "ABSENT", "MISSING", "NO_MATCH", "DELETED", "REMOVED"}
-POSITIVE = {"FOUND", "PRESENT", "ACTIVE", "HIT", "EXISTS"}
+# ---------------------------------------------------------------------------
+# Request intent.
+
+DELETE_WORDS = re.compile(
+    r"\b(delet\w*|eras\w*|remov\w*|clos(?:e|ed|ing|ure)\b|right to be forgotten|forget me|"
+    r"gone|suppression|supprim\w*|effac\w*|exclus[aã]o|exclu[ií]\w*|elimina\w*|borra\w*|"
+    r"l[oö]sch\w*|disconnected)|削除|消去|탈퇴|삭제|删除", re.I)
+NEGATED = re.compile(
+    r"\b(?:not|n't|never|no|without)\b(?:\W+\w+){0,3}?\W+(?:delet\w*|eras\w*|remov\w*|clos\w*|"
+    r"deletion|asking for deletion)", re.I)
+KEEP_ACCOUNT = re.compile(
+    r"\b(?:keep|leave)\b(?:\W+\w+){0,3}?\W+(?:account|profile)\b(?:\W+\w+){0,3}?\W+"
+    r"(?:active|as it is|in place|open)|\bleave\b(?:\W+\w+){0,4}?\W+in place|continue using|"
+    r"still (?:need|want|use)\b", re.I)
+SCOPE_ONLY = re.compile(r"\bmarketing lists only\b|\bpromotional emails\b|\bopt[ -]?out\b", re.I)
 
 
-def normalize(value: Any) -> str:
-    text = str(value or "").strip().lower()
-    if "@" in text:
-        return text
-    if text.startswith("+") or (text and all(c.isdigit() or c in "- ()" for c in text)):
-        return "".join(c for c in text if c.isdigit())
-    return text
+def deletion_intent(text: str) -> tuple[bool | None, str]:
+    """True/False when the wording decides it, None when it is genuinely unclear."""
+    if NEGATED.search(text):
+        return False, "deletion is explicitly declined"
+    if KEEP_ACCOUNT.search(text):
+        return False, "the person asks to keep using the account"
+    if SCOPE_ONLY.search(text):
+        return False, "marketing opt-out only"
+    if DELETE_WORDS.search(text):
+        return True, "explicit deletion request"
+    return None, "no deletion wording found"
 
 
-def _is_true(value: Any) -> bool | None:
-    if isinstance(value, bool):
-        return value
-    if str(value).lower() in {"true", "1", "yes", "enabled"}:
-        return True
-    if str(value).lower() in {"false", "0", "no", "disabled"}:
-        return False
-    return None
+# ---------------------------------------------------------------------------
+# Policy: what each data category must look like when deletion is complete.
 
-
-class IdentityResolver:
-    def __init__(self, root: Path):
-        self.current = read_csv(root / "dataset" / "user_identities.csv")
-        self.history = read_csv(root / "dataset" / "user_audit_log.csv")
-        self.by_user = {r["user_id"]: r for r in self.current}
-        self.by_email: dict[str, set[str]] = defaultdict(set)
-        for row in self.current:
-            self.by_email[normalize(row["email"])].add(row["user_id"])
-        for row in self.history:
-            if row["field_name"] == "email":
-                for key in ("old_value", "new_value"):
-                    self.by_email[normalize(row[key])].add(row["user_id"])
-
-    def resolve(self, email: str, cutoff: str) -> tuple[str | None, set[str], bool]:
-        candidates = self.by_email.get(normalize(email), set())
-        user_id = next(iter(candidates)) if len(candidates) == 1 else None
-        terms = {normalize(email)}
-        if not user_id:
-            return None, terms, bool(candidates)
-        terms.add(normalize(user_id))
-        current = self.by_user.get(user_id)
-        if current:
-            # The current snapshot is an identity lookup aid. Its later timestamp
-            # is never used to prove the state of a record at audit_at.
-            for field in ("email", "phone", "email_hash"):
-                if current.get(field):
-                    terms.add(normalize(current[field]))
-        for row in self.history:
-            if row["user_id"] == user_id and iso_at(row["event_time"]) <= cutoff:
-                for field in ("old_value", "new_value"):
-                    if row[field]:
-                        terms.add(normalize(row[field]))
-        return user_id, {t for t in terms if t}, False
-
-    def names(self, user_id: str | None) -> set[str]:
-        if not user_id:
-            return set()
-        name = self.by_user.get(user_id, {}).get("name", "")
-        return {name.lower()} if name else set()
-
-
-def _record_terms(obs: Observation) -> set[str]:
-    values = flatten_values(obs.data)
-    terms = {normalize(v) for v in values if v and len(str(v)) < 200}
-    for value in values:
-        terms.update(x.lower() for x in EMAIL.findall(value))
-    return terms
-
-
-def _associated(obs: Observation, terms: set[str]) -> bool:
-    values = _record_terms(obs)
-    return bool(values & terms)
-
-
-def _has_subject_pii(obs: Observation, terms: set[str], names: set[str]) -> bool:
-    def check(value: Any, key: str = "") -> bool:
-        if isinstance(value, dict):
-            return any(check(v, k) for k, v in value.items())
-        if isinstance(value, list):
-            return any(check(v, key) for v in value)
-        if value is None:
-            return False
-        raw = str(value).lower()
-        if not raw or raw in {"null", "none"}:
-            return False
-        if key in PII_KEYS and (normalize(value) in terms or raw in names):
-            return True
-        if key in {"message_text", "message_excerpt", "document", "text"}:
-            return any(("@" in t or len(t) >= 10) and t in raw for t in terms if not t.startswith("user_")) or any(n in raw for n in names)
-        return False
-    return check(obs.data)
-
-
-def state(obs: Observation, terms: set[str], names: set[str]) -> str:
-    d = obs.data
-    category = obs.category
-    result = str(d.get("result") or d.get("status") or "").upper()
-    event = str(d.get("event") or "").lower()
-    if event.endswith("_failed") or result in {"FAILED", "ERROR", "TIMEOUT", "PARTIAL"}:
-        return "UNKNOWN"
-    if d.get("status_code") in (404, "404") or d.get("http_status") in (404, "404"):
-        return "ABSENT"
-    if result in NEGATIVE or result in {"NOT_FOUND", "NO_HITS", "MISS"}:
-        return "ABSENT"
-    if result in {"ANONYMIZED", "REDACTED", "DISABLED", "BLOCKED", "IDENTIFIABLE"}:
-        return "EXPOSED" if result == "IDENTIFIABLE" else result
-    if str(d.get("rows")) == "0":
-        return "ABSENT"
-    if _is_true(d.get("available")) is False and category == "USER_EXPORT":
-        return "ABSENT"
-    if _is_true(d.get("available")) is True and category == "USER_EXPORT":
-        return "PRESENT"
-    hits = d.get("hits")
-    if isinstance(hits, dict) and hits.get("total") == 0:
-        return "ABSENT"
+def policy_target(category: str, required: str) -> str:
+    """The compliant final state for a category under its supplied rule."""
     if category == "DATA_FLOW":
-        if result == "ACTIVE":
-            return "ACTIVE"
-        if result in {"INACTIVE", "STOPPED"}:
-            return "DISABLED"
-        enabled = _is_true(d.get("enabled"))
-        if enabled is not None:
-            return "ACTIVE" if enabled else "DISABLED"
-        if str(d.get("last_delivery_status", "")).lower() == "stopped":
-            return "DISABLED"
-        return "UNKNOWN"
+        return "DISABLED"
     if category == "BACKUP_ARCHIVE":
-        if result in {"ACTIVE", "RESTORE_ALLOWED"}:
-            return "ACTIVE"
-        if result in {"RESTORE_BLOCKED", "RESTORE_DENIED"}:
-            return "BLOCKED"
-        allowed = _is_true(d.get("restore_allowed"))
-        if allowed is not None:
-            return "ACTIVE" if allowed else "BLOCKED"
-        return "UNKNOWN"
-    if category in {"ANALYTICS_PROFILE", "PRODUCT_TELEMETRY"}:
-        if str(d.get("event", "")) == "analytics_identity_scan" and d.get("matched_value"):
-            return "EXPOSED"
-        stable = normalize(d.get("user_id") or d.get("customer_reference") or d.get("subject_reference"))
-        if (stable and stable in terms) or _has_subject_pii(obs, terms, names):
-            return "EXPOSED"
-        if any(k in d for k in ("email", "phone", "email_hash", "customer_reference", "user_id")):
-            return "ANONYMIZED"
-    if category in {"SUPPORT_MESSAGE", "EMAIL_DELIVERY_LOG", "ACCOUNT_TOMBSTONE"}:
-        if str(d.get("event", "")) in {"message_pii_scan", "attachment_pii_scan"} and d.get("matched_value"):
-            return "EXPOSED"
-        if _has_subject_pii(obs, terms, names):
-            return "EXPOSED"
-        if any(k in d for k in ("requester_email", "customer_reference", "email", "message_text", "message_excerpt")):
-            return "REDACTED"
-    if result in POSITIVE or obs.method in {"json", "sqlite"}:
-        return "PRESENT"
-    if str(d.get("rows", "")).isdigit() and int(d["rows"]) > 0:
-        return "PRESENT"
-    if str(d.get("event", "")).endswith("_completed") and "result" in d:
-        return "PRESENT" if result in POSITIVE else "UNKNOWN"
-    return "UNKNOWN"
+        return "BLOCKED"
+    return {"DELETE": "ABSENT", "REDACT": "REDACTED", "ANONYMIZE": "ANONYMIZED",
+            "RETAIN": "PRESENT"}.get(required, "")
 
 
-def _store(obs: Observation) -> str:
-    if obs.location.startswith("table:"):
-        return obs.location.split(":")[1]
-    return str(obs.data.get("data_store") or obs.data.get("collection") or obs.system_id or obs.source_path)
+STEP_FOR_TARGET = {
+    # target: (finding, remediation, verification)
+    "ABSENT": ("REPORT_REMAINING_RECORD", "DELETE_RECORD", "VERIFY_RECORD_ABSENT"),
+    "REDACTED": ("REPORT_EXPOSED_PII", "REDACT_RECORD", "VERIFY_RECORD_REDACTED"),
+    "ANONYMIZED": ("REPORT_EXPOSED_PII", "ANONYMIZE_RECORD", "VERIFY_RECORD_ANONYMIZED"),
+    "PRESENT": ("", "", "VERIFY_RECORD_PRESENT"),
+    "DISABLED": ("REPORT_ACTIVE_DATA_FLOW", "DISABLE_DATA_FLOW", "VERIFY_DATA_FLOW_DISABLED"),
+    "BLOCKED": ("REPORT_RESTORE_RISK", "BLOCK_RESTORE", "VERIFY_RESTORE_BLOCKED"),
+}
+
+
+def judge(observation: Observation, target: str) -> str:
+    """Compare one observed state with the compliant target: ok, violation or unknown."""
+    state = observation.state
+    if state == "UNKNOWN":
+        return "unknown"
+    if target == "ABSENT":
+        return "ok" if state == "ABSENT" else "violation"
+    if target in {"REDACTED", "ANONYMIZED"}:
+        if state == "ABSENT":
+            return "ok"
+        if observation.identifying is None:
+            return "unknown"
+        return "violation" if observation.identifying else "ok"
+    if target == "PRESENT":
+        return "ok" if state == "PRESENT" else "unknown"
+    if target == "DISABLED":
+        return {"DISABLED": "ok", "ACTIVE": "violation", "ABSENT": "ok"}.get(state, "unknown")
+    if target == "BLOCKED":
+        return {"BLOCKED": "ok", "RESTORABLE": "violation", "ABSENT": "ok"}.get(state, "unknown")
+    return "unknown"
+
+
+def order_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings, then remediation, then verification; within a phase by operation
+    order (so flows are disabled and restores blocked before records change),
+    then system_id and resource_id. Steps are renumbered from 1."""
+    ordered = sorted(steps, key=lambda s: (PHASE_ORDER[s["phase"]],
+                                           OPERATIONS[s["phase"]].index((s["operation"], s["state"])),
+                                           s["system_id"], s["resource_id"]))
+    for n, step in enumerate(ordered, 1):
+        step["step_no"] = n
+    return ordered
+
+
+def parse_time(value: str) -> datetime:
+    return datetime.fromisoformat(iso_at(value).replace("Z", "+00:00"))
+
+
+def resource_type(resource: str) -> str:
+    return resource.rsplit("_", 1)[0]
+
+
+# A workflow run performs its operations shortly before it reports a status,
+# and final results from downstream systems can arrive a couple of hours later.
+WORKFLOW_BEFORE = timedelta(hours=2)
+WORKFLOW_AFTER = timedelta(hours=2, minutes=30)
+NEAREST_MARGIN = timedelta(minutes=30)
+RUN_RESULT = {"COMPLETE": "SUCCESS", "PARTIALLY_COMPLETE": "PARTIAL", "NOT_STARTED": "FAILED"}
+USER_REFERENCE = re.compile(r"\buser_\d+\b")
+CATALOG_LINK = re.compile(r"linked (\S+) \(([^)]*)\) to (\S+) and (user_\d+)")
+CATALOG_ONLY = re.compile(r"confirmed (\S+) \(([^)]*)\) belongs only to (\S+) and (user_\d+)")
+RESTORED_INTO = re.compile(r"repopulated downstream resource (\S+?)\.?$")
+CHECK_STATES = {"CHECK_DATA_FLOW": "ACTIVE", "CHECK_RESTORE_ACCESS": "RESTORABLE"}
 
 
 class AuditEngine:
     def __init__(self, root: Path, use_gemini: bool = True):
         self.root = root
-        self.identity = IdentityResolver(root)
+        self.identity = IdentityIndex(root)
         self.evidence = EvidenceIndex.load(root)
-        self.rules = {r["data_category"]: r["required_action"] for r in read_csv(root / "dataset" / "deletion_rules.csv")}
+        self.rules = {r["data_category"]: r for r in read_csv(root / "dataset" / "deletion_rules.csv")}
         self.gemini = GeminiInterpreter(root) if use_gemini else None
         self.activity = read_csv(root / "dataset" / "system_activity.csv")
-        self.activity_by_resource: dict[str, list[dict[str, str]]] = defaultdict(list)
+        self.activity_by_id = {e["activity_id"]: e for e in self.activity}
+        self.evidence_files = {r["file_id"]: r for r in read_csv(root / "dataset" / "evidence_files.csv")}
+        self.by_resource: dict[str, list[Observation]] = defaultdict(list)
+        for obs in self.evidence.observations:
+            self.by_resource[obs.resource_id].append(obs)
+        self.aliases: dict[str, str] = {}
+        self.owners: dict[str, set[str]] = defaultdict(set)
+        self.owner_sources: dict[tuple[str, str], set[str]] = defaultdict(set)
+        self._build_ownership()
+        self._add_activity_observations()
+        self._add_document_observations()
+        self.file_terms: dict[str, set[str]] = defaultdict(set)
+        for obs in self.evidence.observations:
+            self.file_terms[obs.evidence_id].update(obs.keys)
+        self.activity_time = {e["activity_id"]: iso_at(e["event_time"]) for e in self.activity}
+        # First and last time evidence or an explicit link mentions each resource.
+        # Routine activity is left out: it often belongs to someone else's workflow.
+        self.first_seen: dict[str, str] = {}
+        self.last_seen: dict[str, str] = defaultdict(str)
+        times: dict[str, list[str]] = defaultdict(list)
+        for obs in self.evidence.observations:
+            times[obs.resource_id].append(obs.time())
+        for (resource, _), sources in self.owner_sources.items():
+            times[resource].extend(self.activity_time[s] for s in sources if s in self.activity_time)
+        for resource, seen in times.items():
+            self.first_seen[resource] = min(seen)
+            self.last_seen[resource] = max(seen)
+        self.assigned: dict[str, dict[str, str]] = {}
+        self.cycles: dict[str, list[dict[str, str]]] = defaultdict(list)
+        self._assign_workflow_events()
+        # The evidence graph holds every link above with its provenance; the
+        # case investigation reads identities and record links from it.
+        self.graph = EvidenceGraph.build(self)
+        for case, resources in self.assigned.items():
+            self.graph.add_workflow_links(case, resources, self.activity_time)
+
+    # -- ownership graph ----------------------------------------------------
+
+    def _link(self, resource: str, user: str, source: str) -> None:
+        self.owners[resource].add(user)
+        self.owner_sources[(resource, user)].add(source)
+
+    def _build_ownership(self) -> None:
+        """Connect resources to people only through identifiers or explicit links."""
+        for obs in self.evidence.observations:
+            for key in obs.keys:
+                for user in self.identity.users_for(key):
+                    self._link(obs.resource_id, user, obs.evidence_id)
         for event in self.activity:
-            self.activity_by_resource[event["resource_id"]].append(event)
-        self._terms = [_record_terms(obs) for obs in self.evidence.observations]
-        self.by_resource: dict[str, list[int]] = defaultdict(list)
-        for i, obs in enumerate(self.evidence.observations):
-            self.by_resource[obs.resource_id].append(i)
+            if event["event_type"] != "LINK_RESOURCE_IDENTITY":
+                continue
+            match = CATALOG_LINK.search(event["details"]) or CATALOG_ONLY.search(event["details"])
+            if not match:
+                continue
+            resource, alias, _, user = match.groups()
+            self._link(resource, user, event["activity_id"])
+            if alias and alias != resource:
+                self.aliases[alias] = resource
+        # A restore copies the archive owner's data into the restored resource.
+        for event in self.activity:
+            match = RESTORED_INTO.search(event["details"]) if event["event_type"] == "RESTORE_BACKUP" else None
+            if match:
+                for user in set(self.owners.get(event["resource_id"], set())):
+                    self._link(match.group(1), user, event["activity_id"])
+
+    def _add_activity_observations(self) -> None:
+        """Status checks report an observed state; other workflow events are only claims."""
+        for event in self.activity:
+            state = CHECK_STATES.get(event["event_type"])
+            if not state or event["reported_result"] != "SUCCESS":
+                continue
+            resource = event["resource_id"]
+            obs = Observation(
+                evidence_id=event["activity_id"], source_path="system_activity.csv",
+                location=f"activity:{event['activity_id']}", captured_at=iso_at(event["event_time"]),
+                observed_at=iso_at(event["event_time"]), system_id=default_system(resource),
+                resource_id=resource, store="primary", category=default_category(resource),
+                state=state, identifying=None, fields={"details": event["details"]}, method="activity")
+            self.evidence.observations.append(obs)
+            self.by_resource[resource].append(obs)
+
+    def _add_document_observations(self) -> None:
+        """Find resources named in PDFs and screenshots, allowing for OCR spacing errors."""
+        known = set(self.by_resource) | {e["resource_id"] for e in self.activity} | set(self.owners)
+        loose = re.compile(r"\b(" + "|".join(sorted({resource_type(r) for r in known if RESOURCE.fullmatch(r)},
+                                                    key=len, reverse=True)) + r")[\s._]?(\d+)\b")
+        for doc in self.evidence.documents:
+            if doc.method not in {"pdf_text", "pdf_ocr", "ocr"} or not doc.text:
+                continue
+            found: dict[str, str] = {}
+            for resource in RESOURCE.findall(doc.text):
+                found[resource] = "resource ID in text"
+            # OCR can turn the underscore into a dot or space; accept that only
+            # for IDs that other evidence or activity already names.
+            for prefix, number in loose.findall(doc.text):
+                resource = f"{prefix}_{number}"
+                if resource in known:
+                    found.setdefault(resource, "resource ID in OCR text")
+            flat = re.sub(r"[\W_]+", "", doc.text.lower())
+            people = set(USER_REFERENCE.findall(doc.text))
+            for alias, resource in self.aliases.items():
+                # A user reference names a record only in a document about that one person.
+                if USER_REFERENCE.fullmatch(alias) and people != {alias}:
+                    continue
+                stem = re.sub(r"\.[a-z]{3}$", "", alias.lower())
+                pattern = re.sub(r"[\W_]+", "", stem)
+                if pattern and re.search(re.escape(pattern) + r"(?!\d)", flat):
+                    found.setdefault(resource, f"catalog alias {alias}")
+            emails = {normalize(e) for e in EMAIL.findall(doc.text)}
+            phones = {normalize(p) for p in PHONE.findall(doc.text)}
+            # Only a document about a single resource ties that resource to the
+            # people it names; a list of many records does not.
+            keys = (emails | phones) if len(found) == 1 else set()
+            for resource, how in found.items():
+                category = default_category(resource)
+                if resource.startswith("support_") and doc.method.startswith("pdf"):
+                    category = "SUPPORT_ATTACHMENT"   # a stored document is an attachment
+                state = "PRESENT"
+                if resource.startswith("data_flow_"):
+                    state = "DISABLED" if re.search(r"\b(disabled|paused|stopped)\b", doc.text, re.I) else "ACTIVE"
+                elif resource.startswith("backup_"):
+                    # A listed archive holding the person's data is a restore path
+                    # unless the page shows that restore is blocked.
+                    blocked = re.search(r"restore (?:blocked|denied|disabled)|legal block|deletion block", doc.text, re.I)
+                    state = "BLOCKED" if blocked else "RESTORABLE"
+                obs = Observation(
+                    evidence_id=doc.evidence_id, source_path=doc.source_path, location=how,
+                    captured_at=doc.captured_at, observed_at=doc.captured_at,
+                    system_id=default_system(resource), resource_id=resource, store="primary",
+                    category=category, state=state, identifying=bool(emails or phones),
+                    keys=keys, fields={}, method=doc.method)
+                self.evidence.observations.append(obs)
+                self.by_resource[resource].append(obs)
+                for key in keys:
+                    for user in self.identity.users_for(key):
+                        self._link(resource, user, doc.evidence_id)
+
+    # -- workflow events ----------------------------------------------------
+
+    def _requests(self) -> list[dict[str, str]]:
+        rows: dict[str, dict[str, str]] = {}
+        for name in ("sample_deletion_requests.csv", "deletion_requests.csv"):
+            path = self.root / "dataset" / name
+            if path.is_file():
+                for row in read_csv(path):
+                    rows[row["case_id"]] = row
+        return list(rows.values())
+
+    def _assign_workflow_events(self) -> None:
+        """Attach deletion-worker events to the request whose workflow produced them.
+
+        Events carry no person, so a resource is attached only when the evidence
+        already ties it to the person, or when exactly one request can still
+        claim it after these eliminations:
+        - a resource the evidence ties to someone else is not claimable;
+        - a run touches at most one resource of each type;
+        - a primary-profile result must agree with the status that run reported;
+        - a contested event goes to the run whose report is clearly nearest in time.
+        Ties that remain are left unassigned rather than guessed.
+        """
+        worker = [e for e in self.activity if e["source_system"] == "deletion_worker"]
+        subjects: dict[str, str] = {}
+        candidates: dict[str, dict[str, str]] = {}
+        for request in self._requests():
+            authorized, _ = deletion_intent(request["request_text"])
+            user, _ = self.identity.resolve(request["email"], request["requested_at"])
+            if authorized is False or not user:
+                continue
+            subjects[request["case_id"]] = user
+            self.cycles[user].append(request)
+            low = max(parse_time(request["requested_at"]), parse_time(request["reported_at"]) - WORKFLOW_BEFORE)
+            high = parse_time(request["reported_at"]) + WORKFLOW_AFTER
+            mine: dict[str, str] = {}
+            for event in worker:
+                when = parse_time(event["event_time"])
+                if not low <= when <= high:
+                    continue
+                # The status a workflow reports is the outcome of its own primary
+                # profile operation. Used only to match a claim to its run, never
+                # as proof of the resulting state.
+                if ("submitted primary profile" in event["details"]
+                        and RUN_RESULT.get(request["reported_status"]) not in (None, event["reported_result"])):
+                    continue
+                mine.setdefault(event["resource_id"], event["activity_id"])
+            candidates[request["case_id"]] = mine
+        assigned: dict[str, dict[str, str]] = {case: {} for case in candidates}
+        open_claims: dict[str, dict[str, str]] = {case: {} for case in candidates}
+        for case, mine in candidates.items():
+            for resource, activity_id in mine.items():
+                owners = self.owners.get(resource, set())
+                if subjects[case] in owners:
+                    assigned[case][resource] = activity_id
+                elif not owners:
+                    open_claims[case][resource] = activity_id
+        reported = {r["case_id"]: parse_time(r["reported_at"]) for r in self._requests()}
+        event_time = {e["activity_id"]: parse_time(e["event_time"]) for e in worker}
+        changed = True
+        while changed:
+            changed = self._settle_claims(assigned, open_claims)
+            # When several runs could have produced an event, attribute it to the
+            # run whose reported status is clearly the nearest in time.
+            claimants: dict[str, list[str]] = defaultdict(list)
+            for case, claims in open_claims.items():
+                for resource in claims:
+                    claimants[resource].append(case)
+            for resource, cases in claimants.items():
+                if len(cases) < 2:
+                    continue
+                gaps = sorted((abs(event_time[open_claims[c][resource]] - reported[c]), c) for c in cases)
+                if gaps[1][0] - gaps[0][0] >= NEAREST_MARGIN:
+                    winner = gaps[0][1]
+                    assigned[winner][resource] = open_claims[winner].pop(resource)
+                    for case in cases:
+                        open_claims[case].pop(resource, None)
+                    changed = True
+                    break
+        self.assigned = assigned
+        self.unresolved_claims = open_claims
+
+    @staticmethod
+    def _settle_claims(assigned: dict[str, dict[str, str]], open_claims: dict[str, dict[str, str]]) -> bool:
+        """Apply the one-resource-per-type and single-claimant rules until stable."""
+        any_change = False
+        changed = True
+        while changed:
+            changed = False
+            # A workflow run touches at most one resource of each type, so a
+            # request that already has one stops claiming the others.
+            for case, claims in open_claims.items():
+                have = {resource_type(r) for r in assigned[case]}
+                for resource in [r for r in claims if resource_type(r) in have]:
+                    del claims[resource]
+                    changed = True
+            claimants: dict[str, list[str]] = defaultdict(list)
+            for case, claims in open_claims.items():
+                for resource in claims:
+                    claimants[resource].append(case)
+            for resource, cases in claimants.items():
+                if len(cases) == 1:
+                    case = cases[0]
+                    assigned[case][resource] = open_claims[case].pop(resource)
+                    changed = True
+            any_change = any_change or changed
+        return any_change
+
+    # -- one case -------------------------------------------------------------
 
     def deletion_intent(self, text: str) -> tuple[bool, str]:
-        if DENIAL.search(text) and not re.search(r"\b(but|instead|now)\b.*" + DELETE_INTENT.pattern, text, re.I):
-            return False, "explicit denial"
-        if DELETE_INTENT.search(text):
-            return True, "explicit deletion request"
-        if NONDELETE.search(text):
-            return False, "non-deletion request"
-        if self.gemini and self.gemini.ready:
-            answer = self.gemini.deletion_intent(text)
-            if answer is not None:
-                return answer, "Gemini classified ambiguous language"
-        return False, "ambiguous request without supported deletion authorization"
+        answer, reason = deletion_intent(text)
+        if answer is None and self.gemini and self.gemini.ready:
+            model_answer = self.gemini.deletion_intent(text)
+            if model_answer is not None:
+                return model_answer, "Gemini classified ambiguous language"
+        return bool(answer), reason
+
+    def category_of(self, resource: str, observations: list[Observation]) -> str:
+        default = default_category(resource)
+        stated = [o.category for o in observations if o.category and o.category != default]
+        return stated[-1] if stated else default
+
+    def required_action(self, category: str, observations: list[Observation], cutoff: str) -> str:
+        rule = self.rules.get(category)
+        if category == "DATA_FLOW":
+            return "DISABLE"
+        if not rule:
+            return ""
+        if category == "SECURITY_AUDIT_LOG":
+            ends = [iso_at(o.fields.get("retention_until")) for o in observations if o.fields.get("retention_until")]
+            if ends and max(ends) < cutoff:
+                return "DELETE"   # outside the supplied retention period
+        return rule["required_action"]
+
+    def store_states(self, resource: str, observations: list[Observation],
+                     cutoff: str, terms: set[str], category: str = "") -> dict[str, Observation]:
+        """Latest observation of each store at the cutoff, including supported absence.
+
+        A row missing from a snapshot proves absence only for account profiles:
+        profile tables list accounts, while the other inventories are partial
+        extracts (an export missing from July inventories is present again in a
+        September log). A missing row never proves a retained record was lost.
+        """
+        omission_proves_absence = category == "USER_PROFILE"
+        explicit: dict[str, Observation] = {}
+        for obs in observations:
+            current = explicit.get(obs.store)
+            if current is None or obs.time() >= current.time():
+                explicit[obs.store] = obs
+        inferred: dict[str, Observation] = {}
+        system = default_system(resource)
+        for cover in self.evidence.coverage:
+            if cover.system_id != system or cover.captured_at > cutoff or resource in cover.present:
+                continue
+            if not omission_proves_absence:
+                break
+            if cover.scoped and not (self.file_terms.get(cover.evidence_id, set()) & terms):
+                continue
+            current = inferred.get(cover.store)
+            if current is None or cover.captured_at >= current.time():
+                path = self.evidence_files.get(cover.evidence_id, {}).get("file_path", "")
+                inferred[cover.store] = Observation(
+                    evidence_id=cover.evidence_id, source_path=path,
+                    location=f"absent from {cover.system_id} ({cover.store})", captured_at=cover.captured_at,
+                    observed_at=cover.captured_at, system_id=system, resource_id=resource,
+                    store=cover.store, category=default_category(resource), state="ABSENT",
+                    identifying=None, method="coverage", inferred=True)
+        chosen = dict(explicit)
+        for store, obs in inferred.items():
+            seen = chosen.get(store)
+            if seen is None or (obs.time() > seen.time() and seen.state != "ABSENT"):
+                chosen[store] = obs
+        return chosen
 
     def investigate(self, request: dict[str, str]) -> tuple[dict[str, str], dict[str, Any]]:
         case = request["case_id"]
         cutoff = iso_at(request["audit_at"])
         authorized, intent_reason = self.deletion_intent(request["request_text"])
         if not authorized:
-            return {"case_id": case, "deletion_status": "NOT_APPLICABLE", "steps_json": "[]"}, {
-                "intent": intent_reason, "resources": [], "uncertain": []}
-        user_id, terms, ambiguous_identity = self.identity.resolve(request["email"], cutoff)
-        names = self.identity.names(user_id)
-        seed_indices = [i for i, obs in enumerate(self.evidence.observations)
-                        if obs.available_at(cutoff) and bool(self._terms[i] & terms)]
-        resources = {self.evidence.observations[i].resource_id for i in seed_indices}
-        activity_claims = [
-            {"activity_id": event["activity_id"], "event_time": event["event_time"],
-             "event_type": event["event_type"], "reported_result": event["reported_result"],
-             "resource_id": event["resource_id"]}
-            for resource in resources for event in self.activity_by_resource.get(resource, [])
-            if iso_at(event["event_time"]) <= cutoff
-        ]
-        activity_claims.sort(key=lambda event: (event["event_time"], event["activity_id"]))
-        indices = {i for resource in resources for i in self.by_resource[resource]
-                   if self.evidence.observations[i].available_at(cutoff)}
-        grouped: dict[tuple[str, str], list[Observation]] = defaultdict(list)
-        for i in indices:
-            obs = self.evidence.observations[i]
-            if obs.category and not obs.claim:
-                grouped[(obs.system_id, obs.resource_id)].append(obs)
-        assessed: list[dict[str, Any]] = []
-        unknown: list[str] = []
-        model_hints: list[dict[str, str]] = []
+            return ({"case_id": case, "deletion_status": "NOT_APPLICABLE", "steps_json": "[]"},
+                    {"intent": intent_reason, "resources": [], "uncertain": []})
+        user, candidates = self.identity.resolve(request["email"], request["requested_at"])
+        detail: dict[str, Any] = {"intent": intent_reason, "user_id": user, "identity_candidates": candidates,
+                                  "resources": [], "uncertain": [], "unobserved": []}
+        if not user:
+            detail["uncertain"].append("request email does not identify exactly one person")
+            return {"case_id": case, "deletion_status": "INCOMPLETE", "steps_json": "[]"}, detail
+        terms = self.graph.identifier_terms(user)
+        detail["historical_identifiers"] = self.identity.identity_evidence(user)
+        linked = {node.split(":", 1)[1]: sorted({e.evidence_id for e in edges})
+                  for node, edges in self.graph.links_to_person(user).items()}
+        # A person can delete an account, sign up again and ask again. Records
+        # whose whole evidence trail ended by an earlier request's audit belong
+        # to that earlier deletion cycle, not to this one.
+        earlier = [iso_at(r["audit_at"]) for r in self.cycles.get(user, [])
+                   if iso_at(r["requested_at"]) < iso_at(request["requested_at"])]
+        if earlier:
+            boundary = max(earlier)
+            for resource in [r for r in linked if self.last_seen.get(r, "") <= boundary]:
+                detail.setdefault("earlier_cycle_resources", []).append(resource)
+                del linked[resource]
+        # A record first mentioned after the audit did not exist yet as far as
+        # the evidence shows, so it is not part of this audit.
+        for resource in [r for r in linked if self.first_seen.get(r, "") > cutoff]:
+            detail.setdefault("later_resources", []).append(resource)
+            del linked[resource]
+        # This request's own workflow events date its resources, so they stay in scope.
+        for resource, activity_id in self.assigned.get(case, {}).items():
+            linked.setdefault(resource, []).append(f"workflow {activity_id}")
+        detail["unassigned_workflow_resources"] = sorted(self.unresolved_claims.get(case, {}))
         findings: list[dict[str, Any]] = []
         remediation: list[dict[str, Any]] = []
         verification: list[dict[str, Any]] = []
-        for (system, resource), observations in grouped.items():
-            # Keep conflicting stores separate. Only the latest observation from a
-            # given store can supersede that store's older observation.
-            per_store: dict[str, Observation] = {}
-            for obs in observations:
-                store = _store(obs)
-                previous = per_store.get(store)
-                if previous is None or (obs.captured_at, obs.observed_at) > (previous.captured_at, previous.observed_at):
-                    per_store[store] = obs
-            candidates = list(per_store.values())
-            category = max(candidates, key=lambda o: (o.captured_at, o.observed_at)).category
-            required = self.rules.get(category)
-            if category == "DATA_FLOW":
-                required = "DISABLE"
-            if not required:
+        evidence_checks: list[dict[str, Any]] = []
+        unknown = 0
+        for resource in sorted(linked):
+            if not RESOURCE.fullmatch(resource):
                 continue
-            states = [(obs, state(obs, terms, names)) for obs in candidates]
-            if category == "SECURITY_AUDIT_LOG":
-                states = [(obs, s) for obs, s in states if not obs.data.get("retention_until") or
-                          iso_at(obs.data["retention_until"]) >= cutoff]
-                if not states:
-                    continue
-            violations = self._violations(category, required, states)
-            chosen = max(violations or states, key=lambda pair: (pair[0].captured_at, pair[0].observed_at), default=None)
-            if chosen is None:
+            available = [o for o in self.by_resource.get(resource, []) if o.available_at(cutoff)]
+            category = self.category_of(resource, self.by_resource.get(resource, []))
+            required = self.required_action(category, available, cutoff)
+            target = policy_target(category, required)
+            if not target:
                 continue
-            obs, observed_state = chosen
-            assessed.append({"system_id": system, "resource_id": resource, "category": category,
-                             "required": required, "state": observed_state, "evidence_id": obs.evidence_id,
-                             "observations": len(observations), "conflict": len({s for _, s in states}) > 1})
-            if observed_state == "UNKNOWN":
-                unknown.append(resource)
-                if self.gemini and self.gemini.ready and obs.method in {"ocr", "pdf_text", "pdf_ocr"}:
-                    excerpt = str(obs.data.get("raw_line") or obs.data.get("text") or "")
-                    if excerpt:
-                        hint = self.gemini.interpret_excerpt(excerpt)
-                        if hint:
-                            model_hints.append({"resource_id": resource, "hint": hint,
-                                                "source_path": obs.source_path, "evidence_id": obs.evidence_id})
+            system = default_system(resource)
+            finding_op, remedy_op, verify_op = STEP_FOR_TARGET[target]
+            stores = self.store_states(resource, available, cutoff, terms, category)
+            verdicts = {store: judge(obs, target) for store, obs in stores.items()}
+            record = {"resource_id": resource, "system_id": system, "category": category,
+                      "required": required, "target": target, "linked_by": linked[resource],
+                      "stores": {s: {"state": o.state, "identifying": o.identifying, "evidence_id": o.evidence_id,
+                                     "observed_at": o.time(), "verdict": verdicts[s], "inferred": o.inferred}
+                                 for s, o in stores.items()}}
+            detail["resources"].append(record)
+            if not stores:
+                detail["unobserved"].append(resource)
+                verification.append(self._step("VERIFICATION", system, resource, verify_op, ""))
                 continue
-            if violations:
-                finding, remedy, verify = self._actions(category, required, observed_state)
-                if finding:
-                    findings.append(self._step("FINDING", system, resource, finding, obs.evidence_id))
-                if remedy:
-                    remediation.append(self._step("REMEDIATION", system, resource, remedy, ""))
-                if verify:
-                    verification.append(self._step("VERIFICATION", system, resource, verify, ""))
+            bad = [stores[s] for s, v in verdicts.items() if v == "violation"]
+            good = [stores[s] for s, v in verdicts.items() if v == "ok"]
+            if bad and finding_op:
+                proof = max(bad, key=lambda o: (o.time(), not o.inferred))
+                findings.append(self._step("FINDING", system, resource, finding_op, proof.evidence_id))
+                remediation.append(self._step("REMEDIATION", system, resource, remedy_op, ""))
+                verification.append(self._step("VERIFICATION", system, resource, verify_op, ""))
+            elif good and len(good) == len(stores):
+                proof = max(good, key=lambda o: (o.time(), not o.inferred))
+                evidence_checks.append(self._step("VERIFICATION", system, resource, verify_op, proof.evidence_id))
             else:
-                verify = self._verification(category, required)
-                if verify:
-                    verification.append(self._step("VERIFICATION", system, resource, verify, obs.evidence_id))
-        incomplete = bool(findings or unknown or ambiguous_identity or not assessed or self.evidence.extraction_errors)
-        if incomplete:
-            for step in verification:
+                unknown += 1
+                detail["uncertain"].append(resource)
+                verification.append(self._step("VERIFICATION", system, resource, verify_op, ""))
+        if findings or unknown:
+            status = "INCOMPLETE"
+            for step in evidence_checks:
                 step["evidence_id"] = ""
+            verification.extend(evidence_checks)
+        elif evidence_checks:
+            # Every observed resource is compliant. Resources known only from
+            # later evidence cannot be checked at audit_at, so they are reported
+            # in the investigation detail instead of the verification list.
+            status = "COMPLETE"
+            verification = evidence_checks
         else:
-            findings.clear()
-            remediation.clear()
-        steps = findings + remediation + verification
-        steps.sort(key=lambda s: (PHASE_ORDER[s["phase"]],
-                                  OPERATIONS[s["phase"]].index((s["operation"], s["state"])),
-                                  s["system_id"], s["resource_id"]))
-        # A resource can be seen in multiple sources; emit one operation per resource.
-        unique: list[dict[str, Any]] = []
-        seen: set[tuple[str, str, str]] = set()
-        for step in steps:
-            key = (step["phase"], step["operation"], step["resource_id"])
-            if key not in seen:
-                unique.append(step)
-                seen.add(key)
-        for n, step in enumerate(unique, 1):
-            step["step_no"] = n
-        row = {"case_id": case, "deletion_status": "INCOMPLETE" if incomplete else "COMPLETE",
-               "steps_json": json.dumps(unique, separators=(",", ":"), ensure_ascii=False)}
-        return row, {"intent": intent_reason, "user_id": user_id, "resources": assessed,
-                     "uncertain": unknown, "ambiguous_identity": ambiguous_identity,
-                     "matched_observations": len(indices), "model_hints": model_hints,
-                     "activity_claims": activity_claims}
-
-    @staticmethod
-    def _violations(category: str, required: str, states: list[tuple[Observation, str]]) -> list[tuple[Observation, str]]:
-        if category == "BACKUP_ARCHIVE":
-            return [(o, s) for o, s in states if s == "ACTIVE"]
-        if category == "DATA_FLOW":
-            return [(o, s) for o, s in states if s == "ACTIVE"]
-        expected = {"DELETE": "ABSENT", "REDACT": "REDACTED", "ANONYMIZE": "ANONYMIZED", "RETAIN": "PRESENT"}.get(required)
-        return [(o, s) for o, s in states if s not in {expected, "UNKNOWN"}]
-
-    @staticmethod
-    def _actions(category: str, required: str, observed: str) -> tuple[str, str, str]:
-        if category == "DATA_FLOW":
-            return "REPORT_ACTIVE_DATA_FLOW", "DISABLE_DATA_FLOW", "VERIFY_DATA_FLOW_DISABLED"
-        if category == "BACKUP_ARCHIVE":
-            return "REPORT_RESTORE_RISK", "BLOCK_RESTORE", "VERIFY_RESTORE_BLOCKED"
-        if required == "DELETE":
-            return "REPORT_REMAINING_RECORD", "DELETE_RECORD", "VERIFY_RECORD_ABSENT"
-        if required == "REDACT":
-            return "REPORT_EXPOSED_PII", "REDACT_RECORD", "VERIFY_RECORD_REDACTED"
-        if required == "ANONYMIZE":
-            return "REPORT_EXPOSED_PII", "ANONYMIZE_RECORD", "VERIFY_RECORD_ANONYMIZED"
-        return "", "", "VERIFY_RECORD_PRESENT"
-
-    @staticmethod
-    def _verification(category: str, required: str) -> str:
-        if category == "DATA_FLOW":
-            return "VERIFY_DATA_FLOW_DISABLED"
-        if category == "BACKUP_ARCHIVE":
-            return "VERIFY_RESTORE_BLOCKED"
-        return {"DELETE": "VERIFY_RECORD_ABSENT", "REDACT": "VERIFY_RECORD_REDACTED",
-                "ANONYMIZE": "VERIFY_RECORD_ANONYMIZED", "RETAIN": "VERIFY_RECORD_PRESENT"}.get(required, "")
+            status = "INCOMPLETE"
+            detail["uncertain"].append("no evidence before audit_at establishes any resource state")
+        steps = order_steps(findings + remediation + verification)
+        row = {"case_id": case, "deletion_status": status,
+               "steps_json": json.dumps(steps, separators=(",", ":"), ensure_ascii=False)}
+        return row, detail
 
     @staticmethod
     def _step(phase: str, system: str, resource: str, operation: str, evidence: str) -> dict[str, Any]:

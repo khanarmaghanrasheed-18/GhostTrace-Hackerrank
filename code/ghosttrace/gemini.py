@@ -31,15 +31,25 @@ class GeminiInterpreter:
         return bool(self.key) and not self.disabled
 
     def _call(self, prompt: str, allowed: set[str]) -> str | None:
+        """One decision chosen from `allowed`, or None."""
+        parsed = self._call_json(prompt)
+        answer = parsed.get("decision") if isinstance(parsed, dict) else None
+        if parsed is not None and answer not in allowed:
+            self.failures.append("Gemini returned a decision outside the allowed values")
+            return None
+        return answer
+
+    def _call_json(self, prompt: str) -> dict[str, Any] | None:
+        """One JSON object from the model, cached by prompt. The caller validates it."""
         if not self.ready:
             return None
         digest = hashlib.sha256((self.model + "\n" + prompt).encode()).hexdigest()
         cache_file = self.cache_dir / f"{digest}.json"
         if cache_file.is_file():
             value = json.loads(cache_file.read_text(encoding="utf-8"))
-            if value.get("answer") in allowed:
+            if isinstance(value.get("response"), dict):
                 self.cache_hits += 1
-                return value["answer"]
+                return value["response"]
         if self.calls >= self.max_calls:
             if "Gemini call budget exhausted" not in self.failures:
                 self.failures.append("Gemini call budget exhausted")
@@ -60,13 +70,12 @@ class GeminiInterpreter:
                 self.output_tokens += int(usage.get("candidatesTokenCount") or 0)
                 raw = result["candidates"][0]["content"]["parts"][0]["text"]
                 parsed = json.loads(raw)
-                answer = parsed.get("decision") if isinstance(parsed, dict) else None
-                if answer not in allowed:
-                    self.failures.append("Gemini returned a decision outside the allowed values")
+                if not isinstance(parsed, dict):
+                    self.failures.append("Gemini returned JSON that is not an object")
                     return None
                 self.cache_dir.mkdir(parents=True, exist_ok=True)
-                cache_file.write_text(json.dumps({"answer": answer, "model": self.model}), encoding="utf-8")
-                return answer
+                cache_file.write_text(json.dumps({"response": parsed, "model": self.model}), encoding="utf-8")
+                return parsed
             except HTTPError as exc:
                 self.failures.append(f"Gemini HTTP {exc.code}")
                 if exc.code == 429 and attempt == 0:
@@ -102,6 +111,34 @@ class GeminiInterpreter:
         )
         return self._call(prompt, {"PRESENT", "ABSENT", "EXPOSED", "REDACTED", "ANONYMIZED",
                                    "ACTIVE", "DISABLED", "BLOCKED", "UNKNOWN"})
+
+    def propose_actions(self, question: str, resources: list[dict[str, str]],
+                        actions: list[str]) -> dict[str, Any] | None:
+        """Translate a what-if question into proposed actions on this case's records.
+
+        The answer is only a proposal: the what-if code checks every action and
+        resource ID, and asks for clarification when the model is unsure.
+        """
+        listing = "\n".join(f"- {r['resource_id']} ({r['system_id']}, {r['category']})" for r in resources)
+        prompt = (
+            "You translate a question about a hypothetical data-deletion cleanup into proposed actions. "
+            f"Allowed actions: {', '.join(actions)}. Use only resource IDs from this case:\n{listing}\n"
+            "Return JSON: {\"actions\": [{\"action\": <allowed action>, \"resource_id\": <ID or null>, "
+            "\"candidates\": [<IDs the user might mean when unsure>]}]}. "
+            "Never invent an ID. If the question does not say which record, set resource_id to null "
+            "and list the candidates.\n"
+            f"Question: {question}"
+        )
+        return self._call_json(prompt)
+
+    def reword(self, explanation: str) -> str | None:
+        """Optional plain-language wording of an explanation the engine already verified."""
+        prompt = ("Rewrite this verified audit explanation in plain language for a non-specialist. "
+                  "Do not add, remove or change any fact, ID or conclusion. "
+                  "Return JSON with exactly one key, text.\n" + explanation)
+        parsed = self._call_json(prompt)
+        text = parsed.get("text") if isinstance(parsed, dict) else None
+        return text if isinstance(text, str) and text.strip() else None
 
     def usage(self) -> dict[str, Any]:
         return {"model": self.model if self.calls else None, "calls": self.calls,

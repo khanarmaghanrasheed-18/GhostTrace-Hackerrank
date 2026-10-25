@@ -158,20 +158,55 @@ Before submitting, confirm that:
 
 ## GhostTrace implementation status
 
-The current Python core engine is an **evaluation build**, not a finished submission. It reads only participant-facing `dataset/` files. It uses Python's standard library, plus the `pdftotext`, `pdftoppm`, and `tesseract` executables for document extraction. These tools are installed in the current cloud environment; no Python package installation is required for this build. From the repository root:
+GhostTrace is a terminal-based, evidence-backed deletion audit. It has the following parts:
+
+- an ownership graph of people, identifiers, records, processes and evidence;
+- time-aware reconstruction at each request's `audit_at`;
+- policy-driven remediation steps;
+- per-case graph and timeline views;
+- a hypothetical what-if cleanup checker.
+
+It reads only participant-facing files in `dataset/` and writes the root `output.csv`; `dataset/output.csv` stays the blank template.
+
+**Architecture ownership.** The architecture was chosen in a separate planning conversation, preserved verbatim in [`docs/GHOSTTRACE_PLANNING_CONTEXT.md`](./docs/GHOSTTRACE_PLANNING_CONTEXT.md). Its final "Agreed Architecture" section is authoritative; not every earlier idea in that transcript was adopted. [`docs/PLAN.md`](./docs/PLAN.md) records how the code implements it and the current milestone status.
+
+### Setup
+
+Python 3.12 or newer, standard library only, plus three command-line tools: `pdftotext` and `pdftoppm` (poppler-utils) for PDFs, and `tesseract` for screenshots. On Debian/Ubuntu:
 
 ```bash
-python3 --version
+sudo apt-get install -y poppler-utils tesseract-ocr
 command -v pdftotext pdftoppm tesseract
-python3 code/main.py run
-python3 code/main.py validate
-python3 code/main.py inspect case_05 --input dataset/sample_deletion_requests.csv
-python3 code/evaluation/main.py
+```
+
+### Run (from the repository root)
+
+```bash
+python3 code/main.py run                  # writes output.csv for the 518 requests
+python3 code/main.py validate             # checks the file against the challenge contract
+python3 code/main.py inspect case_29      # one case's steps and investigation detail
+python3 code/main.py graph case_29        # evidence graph at audit_at (--json, --all)
+python3 code/main.py timeline case_29     # events and observed states in time order (--all)
+python3 code/main.py whatif case_29 --reset --add "DELETE_RECORD search_1993"
+python3 code/main.py whatif case_29 --add "DISABLE_DATA_FLOW data_flow_3827"   # proposals accumulate
+python3 code/main.py whatif case_33 --ask "What if I delete the export?"       # asks which export
+python3 code/evaluation/main.py           # public-sample metrics
 python3 -m unittest discover -s code/evaluation -p 'test_*.py' -v
 ```
 
-`run` writes the root-level `output.csv`; `dataset/output.csv` remains the blank template. Extraction results are cached under ignored `.cache/ghosttrace/`. `inspect` prints the case's prediction and observation provenance. The sample evaluator reads expected answers only after prediction; the audit engine never imports `sample_output.csv`.
+Notes on these commands:
 
-Gemini is optional and reserved for ambiguous request language and review hints on difficult extracted text. The engine reads `GEMINI_API_KEY` from the environment, never from source or `.env` files, and limits uncached calls with `GEMINI_MAX_CALLS` (default 20). Run `python3 code/main.py gemini-check` for one minimal live check only after the key and network destination are configured. In the current cloud environment there is no key binding and the Gemini host was denied by the proxy, so no live model call has been made.
+- Sample case IDs (`case_01`–`case_32`) are found automatically by `inspect`, `graph`, `timeline` and `whatif`.
+- What-if results are always labelled hypothetical. Scenarios are kept in the ignored `.cache/ghosttrace/whatif/` folder. They never change `dataset/`, the audit verdict, or `output.csv`.
 
-The most recent public-sample evaluation matched 27 of 32 statuses and exactly matched all steps for 5 of 32 cases. The generated 518-row CSV passes structural validation, but some authorized requests lack enough linked evidence for a supported decision. Treat `output.csv` as provisional; see [`docs/PLAN.md`](./docs/PLAN.md) and [`code/evaluation/evaluation_report.md`](./code/evaluation/evaluation_report.md) before using it for submission.
+### Gemini
+
+Gemini is optional. It is used for:
+
+- genuinely ambiguous request wording;
+- translating natural-language what-if questions;
+- an optional rewording of a verified explanation (`whatif --reword`).
+
+The key is read from the `GEMINI_API_KEY` environment variable only. `GEMINI_MAX_CALLS` (default 20) limits uncached calls. Code validates every model answer.
+
+In the current cloud environment no key is configured, so no live call has been made. `python3 code/main.py gemini-check` reports `ready: false`. Without a key, what-if questions use a labelled local rule reader.
