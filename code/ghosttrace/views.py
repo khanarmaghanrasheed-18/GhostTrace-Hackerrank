@@ -263,3 +263,71 @@ def render_timeline(view: dict[str, Any]) -> str:
         out.append(f"... {view['hidden_after_audit_at']} entries after audit_at hidden (use --all)")
     out.append(view["note"])
     return "\n".join(out)
+
+
+def graph_for_ui(engine: Any, view: dict[str, Any]) -> dict[str, Any]:
+    """The case graph in the node/edge format the local UI draws."""
+    nodes: dict[str, dict[str, Any]] = {}
+    edges: list[dict[str, Any]] = []
+    if not view.get("person"):
+        return {"nodes": [], "edges": []}
+    person = f"person:{view['person']}"
+    nodes[person] = {"id": person, "type": "person", "label": view["person"]}
+
+    def node_for(graph_node: str) -> str:
+        data = engine.graph.nodes.get(graph_node, {})
+        kind = data.get("type", "")
+        if kind == "identifier":
+            nodes.setdefault(graph_node, {"id": graph_node, "type": "identifier", "label": data["label"],
+                                          "kind": data.get("field", ""), "origin": "linked"})
+        elif kind == "request":
+            nodes.setdefault(graph_node, {"id": graph_node, "type": "request", "label": data["label"]})
+        elif kind == "person":
+            nodes.setdefault(graph_node, {"id": graph_node, "type": "person", "label": data["label"]})
+        return graph_node
+
+    for item in view["identity"]:
+        ident = next((n for n, d in engine.graph.nodes.items()
+                      if d["type"] == "identifier" and d["label"] == item["identifier"]), None)
+        if ident:
+            node_for(ident)
+            edges.append({"source": person, "target": ident, "relation": item["relation"], "kind": item["kind"],
+                          "evidence": item["evidence_id"], "time": item["event_time"], "note": item["note"]})
+    for record in view["records"]:
+        rec = f"rec:{record['resource_id']}"
+        verdicts = {info["verdict"] for info in record["state_at_audit"].values()}
+        verdict = "violation" if "violation" in verdicts else "compliant" if verdicts == {"ok"} else \
+            "unknown" if verdicts else "not observed"
+        nodes[rec] = {"id": rec, "type": "process" if record["node_type"] == "process" else "record",
+                      "label": record["resource_id"], "verdict": verdict, "category": record["category"],
+                      "system": record["system_id"], "policy": record["policy"], "required": record["required_state"],
+                      "states": record["state_at_audit"]}
+        for link in record["linked_by"]:
+            source = node_for(link["source"]) if not link["source"].startswith(("record:", "process:")) else link["source"]
+            if source == f"request:{view['case_id']}":
+                nodes.setdefault(source, {"id": source, "type": "request", "label": view["case_id"]})
+            edges.append({"source": source if source in nodes else person, "target": rec, "relation": link["relation"],
+                          "kind": link["kind"], "evidence": link["evidence_id"],
+                          "time": link["event_time"] or link["captured_at"], "note": link["note"],
+                          "after_audit_at": link["after_audit_at"]})
+        for obs in record["observations"]:
+            src = f"src:{obs['evidence_id']}"
+            nodes.setdefault(src, {"id": src, "type": "source", "label": obs["evidence_id"],
+                                   "path": engine.graph.nodes.get(f"evidence:{obs['evidence_id']}", {}).get("path", "")})
+            edges.append({"source": rec, "target": src, "relation": "OBSERVED_IN", "kind": obs["kind"],
+                          "evidence": obs["evidence_id"], "time": obs["event_time"], "note": obs["note"]})
+        for claim in record["claims"]:
+            src = f"src:{claim['evidence_id']}"
+            nodes.setdefault(src, {"id": src, "type": "source", "label": claim["evidence_id"], "path": "system_activity.csv"})
+            edges.append({"source": src, "target": rec, "relation": claim["relation"], "kind": "claimed",
+                          "evidence": claim["evidence_id"], "time": claim["event_time"], "note": claim["note"]})
+        for dest in record["destinations"]:
+            sysnode = f"sys:{dest['target'].split(':', 1)[1]}"
+            nodes.setdefault(sysnode, {"id": sysnode, "type": "system", "label": dest["target"].split(":", 1)[1]})
+            edges.append({"source": rec, "target": sysnode, "relation": "CAN_WRITE_TO", "kind": "derived",
+                          "evidence": dest["evidence_id"], "time": dest["event_time"], "note": dest["note"]})
+    for path in view["recreation_paths"]:
+        for target in path["can_recreate"]:
+            edges.append({"source": f"rec:{path['process']}", "target": f"rec:{target}", "relation": "CAN_RECREATE",
+                          "kind": "derived", "evidence": path["state_evidence"], "note": path.get("destination_basis", "")})
+    return {"nodes": list(nodes.values()), "edges": [e for e in edges if e["source"] in nodes and e["target"] in nodes]}

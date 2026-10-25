@@ -1,0 +1,35 @@
+{
+  "exported_at": "2026-09-19T17:00:00Z",
+  "tickets": [
+    {
+      "ticket_id": "T-5521",
+      "customer_email": "daniel.okafor@example.net",
+      "agent_email": "agent.kim@example.com",
+      "subject": "Parcel not delivered",
+      "updated_at": "2026-02-04T11:20:00Z",
+      "messages": [
+        {
+          "from": "customer",
+          "text": "My order ORD-77102 has not arrived. Call me on +44 7700 900123."
+        },
+        {
+          "from": "agent",
+          "text": "Sorry about that, a replacement is on its way."
+        }
+      ]
+    },
+    {
+      "ticket_id": "T-6610",
+      "customer_email": "p.shah@example.org",
+      "agent_email": "agent.kim@example.com",
+      "subject": "Invoice copy",
+      "updated_at": "2026-08-01T10:00:00Z",
+      "messages": [
+        {
+          "from": "customer",
+          "text": "Could you resend invoice 2025-117?"
+        }
+      ]
+    }
+  ]
+}

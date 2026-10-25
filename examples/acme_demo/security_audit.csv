@@ -1,0 +1,3 @@
+event_id,user_id,event,recorded_at,retention_until
+sec-901,C-10442,account_closure_requested,2026-08-28T14:00:00Z,2033-08-28T00:00:00Z
+sec-902,C-10442,account_closed,2026-09-01T09:30:00Z,2033-09-01T00:00:00Z

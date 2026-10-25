@@ -1,0 +1,6 @@
+request_id,email,phone,name,request_text
+REQ-1,d.okafor@example.com,,Daniel Okafor,Please delete my account and all my personal data.
+REQ-2,p.shah@example.org,,,Please confirm whether you still hold my data.
+REQ-3,mei.lin@example.com,,,Erase everything you have about me.
+REQ-4,tom.becker@example.com,,,Please update my delivery address; keep my account active.
+REQ-5,nobody@example.com,,,Delete my data.

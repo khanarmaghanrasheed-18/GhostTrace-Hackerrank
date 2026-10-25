@@ -1,0 +1,19 @@
+rule_id,data_category,condition,required_action
+P01,USER_PROFILE,Always,DELETE
+P02,SECONDARY_IDENTIFIER,Always,DELETE
+P03,SEARCH_INDEX_ENTRY,Always,DELETE
+P04,CACHE_ENTRY,Always,DELETE
+P05,SUPPORT_MESSAGE,"Conversation contains shared customer, agent, or order context that must be retained",REDACT
+P06,SUPPORT_ATTACHMENT,Attachment belongs only to the deletion subject,DELETE
+P07,ANALYTICS_PROFILE,Record is still attributable to a user,ANONYMIZE
+P08,PRODUCT_TELEMETRY,Record is still attributable to a user,ANONYMIZE
+P09,USER_EXPORT,Always,DELETE
+P10,MARKETING_PROFILE,Always,DELETE
+P11,EMAIL_DELIVERY_LOG,Log contains a user email address,REDACT
+P12,SECURITY_AUDIT_LOG,Record is within the retention period,RETAIN
+P13,LEGAL_HOLD_RECORD,A legal hold is active,RETAIN
+P14,BACKUP_ARCHIVE,Restore access can be blocked,RETAIN
+P15,ACCOUNT_TOMBSTONE,Only a stable internal ID is needed to keep references to retained records,REDACT
+P16,FINANCIAL_RECORD,Invoices and tax records under a statutory retention period,RETAIN
+P17,PERSONAL_RECORD,Any other record about the person,DELETE
+P18,DATA_FLOW,A sync or integration can copy the person's data again,DISABLE

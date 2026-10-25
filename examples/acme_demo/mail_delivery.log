@@ -1,0 +1,3 @@
+2026-08-14T10:02:11Z level=INFO service=mailer event=sent to=daniel.okafor@example.net template=order_shipped
+2026-08-14T10:02:12Z level=INFO service=mailer event=sent to=p.shah@example.org template=order_shipped
+2026-08-29T08:00:00Z level=INFO service=mailer event=sent to=d.okafor@example.com template=closure_confirmation

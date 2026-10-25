@@ -8,3 +8,4 @@ __pycache__/
 *.pem
 *.p12
 *.pfx
+ghosttrace_workspace/
