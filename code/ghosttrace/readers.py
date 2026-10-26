@@ -46,6 +46,11 @@ SUPPORTED = SPREADSHEET | DATABASE | STRUCTURED | DOCUMENT | IMAGE | ARCHIVE
 TIME_FIELDS = ("updated_at", "modified_at", "last_modified", "observed_at", "captured_at", "recorded_at",
                "event_time", "timestamp", "time", "date", "created_at")
 ISO_TIME = re.compile(r"\d{4}-\d\d-\d\d(?:[T ]\d\d:\d\d(?::\d\d)?)?")
+FORM_FIELD = re.compile(r"^\s*([A-Za-z][A-Za-z0-9 ./#()_-]{0,40}?)\s*[:=]\s*(\S.*?)\s*$")
+# Screens often show a label column without colons: "Customer ID    C-10442".
+FORM_LABEL = re.compile(r"^\s*(email address|e-?mail|phone number|phone|mobile|telephone|customer (?:id|number|no)|"
+                        r"user (?:id|name)|account (?:id|number|no|status)|member (?:id|number)|client id|"
+                        r"full name|name|status)\s+(\S.*?)\s*$", re.I)
 
 
 @dataclass
@@ -441,9 +446,14 @@ def read_pdf(source: Source, path: Path) -> None:
         with tempfile.TemporaryDirectory(prefix="ghosttrace-pdf-") as temp:
             run_tool(["pdftoppm", "-r", "200", "-png", str(path), str(Path(temp) / "page")])
             for n, page in enumerate(sorted(Path(temp).glob("page-*.png")), 1):
-                for line, confidence in ocr_lines(page):
+                lines = ocr_lines(page)
+                for line, confidence in lines:
                     source.records.append(Record(source.name, f"page {n} (OCR)", "", {}, text=line,
                                                  method="pdf_ocr", confidence=confidence))
+                fields, lowest = form_fields(lines)
+                if fields:
+                    source.records.append(Record(source.name, f"page {n} (OCR) form fields", "", fields,
+                                                 method="pdf_ocr", confidence=lowest))
     except FileNotFoundError:
         source.errors.append("scanned PDF needs pdftoppm and tesseract for OCR")
     except subprocess.SubprocessError as exc:
@@ -469,6 +479,22 @@ def ocr_lines(path: Path) -> list[tuple[str, float]]:
     return out
 
 
+def form_fields(lines: list[tuple[str, float]]) -> tuple[dict[str, str], float]:
+    """The 'Label: value' lines of a screenshot as fields, e.g. 'Customer ID: C-2041'
+    becomes customer_id=C-2041, with the lowest OCR confidence among those lines."""
+    fields: dict[str, str] = {}
+    lowest = 1.0
+    for line, confidence in lines:
+        found = FORM_FIELD.match(line) or FORM_LABEL.match(line)
+        if not found:
+            continue
+        label = re.sub(r"[^a-z0-9]+", "_", found.group(1).lower().replace("e-mail", "email")).strip("_")
+        if label and label not in fields:
+            fields[label] = found.group(2)
+            lowest = min(lowest, confidence)
+    return fields, lowest
+
+
 def read_image(source: Source, path: Path) -> None:
     try:
         lines = ocr_lines(path)
@@ -481,6 +507,9 @@ def read_image(source: Source, path: Path) -> None:
     for n, (line, confidence) in enumerate(lines, 1):
         source.records.append(Record(source.name, f"OCR line {n}", "", {}, text=line, method="ocr",
                                      confidence=confidence))
+    fields, lowest = form_fields(lines)
+    if fields:
+        source.records.append(Record(source.name, "OCR form fields", "", fields, method="ocr", confidence=lowest))
     if not lines:
         source.errors.append("OCR found no text in this image")
     else:

@@ -214,7 +214,7 @@ function findingRow(f) {
       h("div", {}, [h("h4", {text: "Why it matched"}), h("ul", {}, f.matches.map(m => h("li", {text: `${m.identifier} in ${m.column}: ${m.how}${m.strength === "weak" ? " (possible match)" : ""}`}))),
         h("h4", {text: "Decision"}), h("ul", {}, [
           h("li", {text: `Kind of data: ${f.category} (${f.category_reason})`}),
-          h("li", {text: `Policy: ${f.rule_id} ${f.policy} → must be ${f.required_state}`}),
+          f.claim ? null : h("li", {text: `Policy: ${f.rule_id} ${f.policy} → must be ${f.required_state}`}),
           h("li", {text: `State: ${f.state} — ${f.state_reason}`}),
           h("li", {text: `Still identifies the person: ${f.identifying ? "yes" : "no"} ${f.identifying_values.join(", ")}`}),
           f.superseded_by ? h("li", {text: `Superseded by the later observation ${f.superseded_by}`}) : null,
@@ -232,7 +232,7 @@ function findingRow(f) {
 }
 
 function findingsTab(result) {
-  const verdict = h("select", {}, ["all", "violation", "compliant", "possible match", "unknown", "history"].map(v => h("option", {value: v, text: v})));
+  const verdict = h("select", {}, ["all", "violation", "compliant", "possible match", "unknown", "claim", "history"].map(v => h("option", {value: v, text: v})));
   const search = h("input", {type: "search", placeholder: "filter by file, kind or identifier"});
   const body = h("div");
   const draw = () => {
@@ -346,14 +346,14 @@ async function resultPage(id) {
   const r = saved.result;
   const who = [...(saved.request.emails || []), ...(saved.request.phones || []), ...(saved.request.ids || []), ...(saved.request.names || [])].join(", ");
   const remaining = r.findings.filter(f => f.verdict === "violation");
-  const current = r.findings.filter(f => !["history", "possible match"].includes(f.verdict));
+  const current = r.findings.filter(f => !["history", "possible match", "claim"].includes(f.verdict));
   return h("div", {}, [
     h("h1", {text: `Check: ${who}`}),
     h("div", {class: `verdict ${STATUS_CLASS[r.status]}`}, [h("div", {class: "verdict-title", text: r.status_text}),
       h("div", {class: "small", text: `${r.label}${r.as_of ? " As of " + r.as_of + "." : ""} ${saved.request.label ? "Reference: " + saved.request.label : ""}`})]),
     h("div", {class: "cards"}, [card("Still exists", r.counts.still_exists, "copies that break the policy", r.counts.still_exists ? "bad" : ""),
       card("Compliant", r.counts.compliant, "deleted, redacted or retained as required", "good"),
-      card("Needs review", r.counts.needs_review, "possible matches, unknown states", r.counts.needs_review ? "warn" : ""),
+      card("Needs review", r.counts.needs_review, "possible matches, unknown states, form claims", r.counts.needs_review ? "warn" : ""),
       card("Recreation paths", r.recreation_paths.length, "sync or restore processes that can bring data back", r.recreation_paths.length ? "bad" : ""),
       card("Records scanned", r.counts.records_scanned.toLocaleString(), `${r.counts.sources_used} of ${r.counts.sources} sources`)]),
     h("div", {class: "toolbar"}, [h("a", {class: "button", href: `/api/checks/${id}/export.csv`, text: "Download findings (CSV)"}),

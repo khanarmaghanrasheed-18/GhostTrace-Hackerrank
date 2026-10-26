@@ -37,6 +37,12 @@ from .validate import OPERATIONS
 PHONE = re.compile(r"\+?\d[\d\s().\-]{6,}\d")
 HEX = re.compile(r"\b(?:[0-9a-f]{64}|[0-9a-f]{40}|[0-9a-f]{32})\b", re.I)
 OCR_METHODS = {"ocr", "pdf_ocr"}
+OCR_LINK_CONFIDENCE = 0.8   # identifiers read by OCR below this are only suggested
+# A search screen that found nothing: "No customer found", "0 results", "User not found".
+NO_RESULT = re.compile(r"\b(?:no|0|zero)\s+(?:matching\s+)?(?:results?|records?|matches|customers?|users?|accounts?|"
+                       r"profiles?|members?|contacts?|people|persons?|entries)\b(?!\s+(?:yet|selected))|"
+                       r"\b(?:customer|user|account|record|profile|member|contact|person)\s+(?:was\s+)?not\s+found\b|"
+                       r"\bnothing\s+found\b|\bno\s+match\s+found\b", re.I)
 KEY_FIELDS = ("resource_id", "record_id", "id", "uuid", "ticket_id", "order_id", "invoice_id", "export_id")
 VERDICTS = {
     "STILL_EXISTS": "Personal data still exists",
@@ -258,7 +264,14 @@ def linked_identifiers(record: Record, category: str, finding_id: str) -> list[I
             out.append(identifier(kind, value, "linked", f"same profile record ({column})", finding_id))
         elif belongs_to_subject(column):
             out.append(identifier(kind, value, "suggested", f"{column} on a matched record", finding_id))
-    return [i for i in out if i]
+    out = [i for i in out if i]
+    if record.method in OCR_METHODS and record.confidence < OCR_LINK_CONFIDENCE:
+        # A misread character would point at someone else's data, so a person confirms it.
+        for item in out:
+            if item.origin == "linked":
+                item.origin = "suggested"
+                item.how += f" (read by OCR at {record.confidence:.0%} confidence; check it was read correctly)"
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +343,7 @@ def run_check(sources: list[Source], check: Check) -> dict[str, Any]:
     usable = [s for s in sources if not as_of or s.captured_at <= as_of]
     later_sources = [s.name for s in sources if s not in usable]
     # 1-2. Match, then follow links until no new identifier appears.
+    no_result = no_result_pages(usable)
     rounds = 0
     matches: dict[tuple[str, str], tuple[Record, Source, list[Match]]] = {}
     while True:
@@ -345,12 +359,17 @@ def run_check(sources: list[Source], check: Check) -> dict[str, Any]:
                     matches[(source.name, record.location)] = (record, source, found)
         added = False
         for record, source, found in matches.values():
-            if any(m.strength == "strong" for m in found):
-                category, _ = category_for(record, source_meta(check.meta, source.name).get("category", ""))
-                for item in linked_identifiers(record, category, f"{source.name} / {record.location}"):
-                    added = subject.add(item) or added
+            if not any(m.strength == "strong" for m in found):
+                continue
+            place = page_of(record.location) if record.method in DOCUMENT_METHODS else record.location
+            if record.method in OCR_METHODS and (source.name, place) in no_result:
+                continue   # values typed into a search box are not stored data
+            category, _ = category_for(record, source_meta(check.meta, source.name).get("category", ""))
+            for item in linked_identifiers(record, category, f"{source.name} / {place}"):
+                added = subject.add(item) or added
         if not added or rounds >= 6:
             break
+    hashes = subject.hashes()
     add_trace_matches(usable, matches)
     matches = group_documents(matches)
     # 3. Findings, one per matched record, with the latest state per stored copy.
@@ -359,6 +378,8 @@ def run_check(sources: list[Source], check: Check) -> dict[str, Any]:
         meta = source_meta(check.meta, source_name)
         category, category_reason = category_for(record, meta.get("category", ""))
         state, state_reason = record_state(record, category)
+        if record.method == "ocr" and state_reason == "record is stored":
+            state_reason = "the screen shows this data, so the system behind the screen still holds it"
         strong = any(m.strength == "strong" for m in found)
         shown = identifying_values(record)
         identifying = bool(shown) or any(m.kind in ("email", "phone", "hash") and m.strength == "strong"
@@ -377,6 +398,15 @@ def run_check(sources: list[Source], check: Check) -> dict[str, Any]:
         if category == "SECURITY_AUDIT_LOG" and retention_end and as_of and retention_end < as_of:
             required, rule_id = "DELETE", rules.get("PERSONAL_RECORD", {}).get("rule_id", "")
         target = policy_target(category, required)
+        message = no_result.get((source_name, record.location), "") if record.method in OCR_METHODS else ""
+        claim = message if message and only_searched_values(record, subject, hashes) else ""
+        if claim:
+            category, category_reason = "FORM_LOOKUP", "screenshot of a search that found nothing"
+            state = "UNKNOWN"
+            state_reason = (f"the screen shows \"{claim}\". That is the form's claim, not proof: a form shows only what "
+                            "its query selects and can hide rows marked deleted. Add the database files or table "
+                            "exports behind this form to confirm")
+            identifying, shown, required, rule_id, target = False, [], "", "", ""
         observed = record.observed_at or source.captured_at
         findings.append({
             "id": f"F{n}", "source": source_name, "location": record.location, "container": record.container,
@@ -386,7 +416,7 @@ def run_check(sources: list[Source], check: Check) -> dict[str, Any]:
             "identifying_values": [f"{c}={v}" for c, v in shown][:6], "strength": "strong" if strong else "weak",
             "matches": [m.as_dict() for m in found], "observed_at": observed, "captured_at": source.captured_at,
             "method": record.method, "confidence": round(record.confidence, 2),
-            "excerpt": excerpt(record), "fields": dict(list(record.fields.items())[:40]),
+            "excerpt": excerpt(record), "fields": dict(list(record.fields.items())[:40]), "claim": claim,
         })
     mark_superseded(findings, usable, check.meta)
     for finding in findings:
@@ -413,6 +443,30 @@ def add_trace_matches(sources: list[Source], matches: dict) -> None:
                         f"same trace {trace} as {hit[0].location}", trace)])
 
 
+def no_result_pages(sources: list[Source]) -> dict[tuple[str, str], str]:
+    """Screenshot pages that show a search finding nothing, with the message shown."""
+    pages: dict[tuple[str, str], str] = {}
+    for source in sources:
+        for record in source.records:
+            if record.method in OCR_METHODS and record.text:
+                if NO_RESULT.search(record.text):
+                    pages.setdefault((source.name, page_of(record.location)), record.text[:160])
+    return pages
+
+
+def only_searched_values(record: Record, subject: Subject, hashes: dict[str, tuple[Identifier, str]]) -> bool:
+    """True when every identifier a page shows is one the person is already known by.
+
+    On a search screen that found nothing, those values are what was typed into
+    the search box. Any other identifier means the page shows stored data.
+    """
+    for column, value in record.fields.items():
+        if column_kind(column) and not match_record(Record(record.source, "", fields={column: value}), subject, hashes):
+            return False
+    known = {i.norm for i in subject.active("email")}
+    return all(norm_email(email) in known for email in EMAIL.findall(record.text))
+
+
 def page_of(location: str) -> str:
     """'page 2, line 14' -> 'page 2'; screenshot and document lines -> the whole file."""
     match = re.match(r"(page \d+)", location)
@@ -434,7 +488,9 @@ def group_documents(matches: dict) -> dict:
         gkey = (source.name, place)
         if gkey not in grouped:
             page_text = [r.text for r in source.records if page_of(r.location) == place and r.text]
-            merged = Record(source.name, place, record.container, {}, text="\n".join(page_text)[:4000],
+            form = next((r.fields for r in source.records if page_of(r.location) == place
+                         and r.location.endswith("form fields")), {})
+            merged = Record(source.name, place, record.container, dict(form), text="\n".join(page_text)[:4000],
                             method=record.method, observed_at=record.observed_at,
                             confidence=min(r.confidence for r in source.records if page_of(r.location) == place))
             grouped[gkey] = (merged, source, [])
@@ -491,6 +547,9 @@ def decide(finding: dict[str, Any]) -> None:
     if finding.get("superseded_by"):
         finding["verdict"] = "history"
         return
+    if finding.get("claim"):
+        finding["verdict"] = "claim"
+        return
     if finding["strength"] == "weak":
         finding["verdict"] = "possible match"
         return
@@ -516,11 +575,13 @@ def assemble(sources: list[Source], usable: list[Source], later: list[str], subj
     unknown = [f for f in current if f["verdict"] == "unknown"]
     possible = [f for f in current if f["verdict"] == "possible match"]
     compliant = [f for f in current if f["verdict"] == "compliant"]
+    claims = [f for f in current if f["verdict"] == "claim"]
+    unbacked = claims if not compliant else []   # a form's "not found" with no stored evidence behind it
     unreadable = [s.name for s in usable if s.errors and not s.records]
     paths = recreation_paths(current)
     if violations or paths:
         status = "STILL_EXISTS"
-    elif unknown or possible or unreadable:
+    elif unknown or possible or unbacked or unreadable:
         status = "NEEDS_REVIEW"
     elif compliant:
         status = "DELETED"
@@ -534,7 +595,8 @@ def assemble(sources: list[Source], usable: list[Source], later: list[str], subj
         "suggested_identifiers": [i.as_dict() for i in subject.items.values() if i.origin == "suggested"],
         "counts": {"sources": len(sources), "sources_used": len(usable), "records_scanned": sum(len(s.records) for s in usable),
                    "findings": len(current), "still_exists": len(violations), "compliant": len(compliant),
-                   "needs_review": len(unknown) + len(possible), "history": len(findings) - len(current),
+                   "needs_review": len(unknown) + len(possible) + len(unbacked), "claims": len(claims),
+                   "history": len(findings) - len(current),
                    "identity_rounds": rounds},
         "findings": findings, "recreation_paths": paths, "plan": plan,
         "coverage": {"sources": [s.summary() for s in sources], "unreadable": unreadable,
@@ -635,11 +697,14 @@ def build_graph(result: dict[str, Any]) -> dict[str, Any]:
             target = f"id:{match['identifier']}"
             if target not in nodes:
                 continue
-            edges.append({"source": target, "target": node,
-                          "relation": "APPEARS_IN" if match["strength"] == "strong" else "POSSIBLE_MATCH",
-                          "kind": "observed" if match["strength"] == "strong" else "weak",
+            relation, kind, note = "APPEARS_IN", "observed", match["how"]
+            if finding["verdict"] == "claim":
+                relation, kind, note = "SEARCHED_FOR", "claimed", f"typed into a search that reports: {finding['claim']}"
+            elif match["strength"] != "strong":
+                relation, kind = "POSSIBLE_MATCH", "weak"
+            edges.append({"source": target, "target": node, "relation": relation, "kind": kind,
                           "evidence": f"{finding['source']} / {finding['location']} ({match['column']})",
-                          "time": finding["observed_at"], "note": match["how"]})
+                          "time": finding["observed_at"], "note": note})
         if finding.get("superseded_by"):
             edges.append({"source": f"rec:{finding['superseded_by']}", "target": node, "relation": "SUPERSEDES",
                           "kind": "observed", "evidence": finding["superseded_by"], "time": finding["observed_at"],
@@ -707,7 +772,7 @@ NOUN_CATEGORIES = [
 
 
 def current_findings(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    return {f["id"]: f for f in result["findings"] if f["verdict"] not in ("history", "possible match")}
+    return {f["id"]: f for f in result["findings"] if f["verdict"] not in ("history", "possible match", "claim")}
 
 
 def validate_action(result: dict[str, Any], action: str, target: str | None) -> dict[str, Any]:

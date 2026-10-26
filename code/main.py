@@ -221,7 +221,8 @@ def render_scan(result: dict) -> str:
     c = result["counts"]
     out = [f"VERDICT: {result['status_text']}", result["label"],
            f"{c['records_scanned']} records in {c['sources_used']} of {c['sources']} sources; "
-           f"{c['still_exists']} still exist, {c['compliant']} compliant, {c['needs_review']} need review."]
+           f"{c['still_exists']} still exist, {c['compliant']} compliant, {c['needs_review']} need review"
+           + (f", {c['claims']} form claims" if c.get("claims") else "") + "."]
     out.append("\nIDENTIFIERS")
     for item in result["subject"]:
         out.append(f"  {item['origin']:<9} {item['kind']:<6} {item['value']}  ({item['how']}{'; ' + item['evidence'] if item['evidence'] else ''})")
@@ -232,6 +233,9 @@ def render_scan(result: dict) -> str:
         if f["verdict"] == "history":
             continue
         out.append(f"  {f['id']:<4} {f['verdict']:<14} {f['category']:<19} {f['source']} / {f['location']}")
+        if f["verdict"] == "claim":
+            out.append(f"       {f['state_reason']}")
+            continue
         out.append(f"       {f['state']}: {f['state_reason']}; policy {f['rule_id']} {f['policy']} -> {f['required_state']}")
     for path in result["recreation_paths"]:
         out.append(f"  RECREATION {path['process']} {path['kind']} {path['state']} -> can bring back "

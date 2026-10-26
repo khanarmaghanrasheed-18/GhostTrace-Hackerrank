@@ -59,7 +59,7 @@ tr.detail > td { background: var(--neutral-bg); }
 .badge, .pill { display: inline-block; padding: .1rem .55rem; border-radius: 999px; font-size: .78rem; font-weight: 600; white-space: nowrap; }
 .badge.good, .pill.v-compliant { background: var(--good-bg); color: var(--good); }
 .badge.bad, .pill.v-violation { background: var(--bad-bg); color: var(--bad); }
-.badge.warn, .pill.v-possible-match, .pill.v-unknown { background: var(--warn-bg); color: var(--warn); }
+.badge.warn, .pill.v-possible-match, .pill.v-unknown, .pill.v-claim { background: var(--warn-bg); color: var(--warn); }
 .badge.neutral, .pill.v-history, .pill { background: var(--neutral-bg); color: var(--muted); }
 .verdict { border-radius: 10px; padding: .9rem 1.1rem; margin-bottom: 1rem; border: 1px solid var(--line); }
 .verdict.bad { background: var(--bad-bg); color: var(--bad); } .verdict.good { background: var(--good-bg); color: var(--good); }
@@ -147,7 +147,7 @@ pre.excerpt, pre.explanation { white-space: pre-wrap; word-break: break-word; ba
 .gnode.type-request circle { fill: var(--request); }
 .gnode.verdict-violation circle, .gnode.verdict-violation rect { stroke: var(--bad); stroke-width: 4; }
 .gnode.verdict-compliant circle, .gnode.verdict-compliant rect { stroke: var(--good); stroke-width: 4; }
-.gnode.verdict-possible-match circle, .gnode.verdict-unknown circle, .gnode.verdict-unknown rect { stroke: var(--warn); stroke-width: 4; }
+.gnode.verdict-possible-match circle, .gnode.verdict-unknown circle, .gnode.verdict-unknown rect, .gnode.verdict-claim circle { stroke: var(--warn); stroke-width: 4; }
 .gnode.verdict-history circle { opacity: .45; }
 .gnode.selected circle, .gnode.selected rect { stroke: var(--text); stroke-width: 4; }
 .gnode.hit text { font-weight: 700; fill: var(--accent); }

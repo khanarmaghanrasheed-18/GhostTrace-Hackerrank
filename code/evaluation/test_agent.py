@@ -113,6 +113,81 @@ class ReaderTests(unittest.TestCase):
         self.assertTrue(all(0 <= r.confidence <= 1 for r in shot.records))
 
 
+def have_pillow() -> bool:
+    try:
+        import PIL  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+@unittest.skipUnless(HAVE_OCR and have_pillow(), "needs tesseract and Pillow")
+class FormScreenshotTests(unittest.TestCase):
+    """Screenshots of an application's forms, next to the database files behind them."""
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp(prefix="ghosttrace-test-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.dir)
+
+    def screen(self, name: str, lines: list[str]) -> None:
+        from PIL import Image, ImageDraw
+        image = Image.new("RGB", (900, 80 + 50 * len(lines)), "white")
+        draw = ImageDraw.Draw(image)
+        for n, line in enumerate(lines):
+            draw.text((40, 30 + n * 50), line, fill="black", font=screen_font(24))
+        image.save(self.dir / name)
+
+    def table(self, sql: list[str]) -> None:
+        conn = sqlite3.connect(self.dir / "shop.db")
+        for statement in sql:
+            conn.execute(statement)
+        conn.commit()
+        conn.close()
+
+    def test_search_that_found_nothing_is_a_claim_not_proof(self) -> None:
+        self.screen("customer_search.png", ["Customer Search", "Email: jane.doe@example.com", "No customer found."])
+        alone = scan(self.dir, emails=["jane.doe@example.com"])
+        self.assertEqual(alone["status"], "NEEDS_REVIEW")
+        self.assertEqual(alone["findings"][0]["verdict"], "claim")
+        self.assertEqual(alone["plan"], [])
+        # The table behind the form still holds her row, only flagged as deleted.
+        self.table(["CREATE TABLE customers (customer_id TEXT, email TEXT, is_deleted TEXT)",
+                    "INSERT INTO customers VALUES ('C-2041', 'jane.doe@example.com', '1')"])
+        both = scan(self.dir, emails=["jane.doe@example.com"])
+        self.assertEqual(both["status"], "STILL_EXISTS")
+        self.assertEqual([f["verdict"] for f in by_source(both, "shop.db")], ["violation"])
+
+    def test_details_screen_links_the_ids_it_shows(self) -> None:
+        self.screen("customer_details.png", ["Customer Details", "Customer ID: C-2041", "Name: Jane Doe",
+                                             "Email: jane.doe@example.com", "Phone   +1 555 201 7788"])
+        self.table(["CREATE TABLE marketing_audience (customer_id TEXT, segment TEXT)",
+                    "INSERT INTO marketing_audience VALUES ('C-2041', 'outdoor')"])
+        result = scan(self.dir, emails=["jane.doe@example.com"])
+        linked = {i["key"] for i in result["subject"] if i["origin"] == "linked"}
+        self.assertIn("id:c-2041", linked)
+        self.assertIn("phone:15552017788", linked)
+        self.assertEqual([f["verdict"] for f in by_source(result, "shop.db")], ["violation"])
+        self.assertEqual(by_source(result, "customer_details.png")[0]["verdict"], "violation")
+
+    def test_low_confidence_ocr_only_suggests(self) -> None:
+        record = scanner.Record("s.png", "OCR form fields", fields={"customer_id": "C-2041", "email": "j@example.com"},
+                                method="ocr", confidence=0.5)
+        found = scanner.linked_identifiers(record, "USER_PROFILE", "s.png / whole image")
+        self.assertTrue(found and all(i.origin == "suggested" for i in found))
+
+
+def screen_font(size: int):
+    from PIL import ImageFont
+    for name in ("DejaVuSans.ttf", "Arial.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    return ImageFont.load_default(size=size)
+
+
 class MatchingTests(unittest.TestCase):
     def match(self, text: str, **who) -> list:
         subject = scanner.Subject(who.get("emails", []), who.get("phones", []), who.get("names", []), who.get("ids", []))
