@@ -641,3 +641,23 @@ branch=work
 repo_root=/home/user/GhostTrace-Hackerrank
 worktree=main
 parent_agent=none
+
+## [2026-10-26T10:09:12Z] How to use OpenSanctions data with GhostTrace
+
+User Prompt (verbatim, secrets redacted):
+What if i use opensanctions datasets, How are we gonna use the data?
+
+Agent Response Summary:
+Checked the behaviour against a small mock file with OpenSanctions' simplified-CSV columns and invented people (no real data was downloaded). A passport number in the multi-value identifiers column is a confirmed match. With the default policy the row is reported as still existing; with the file's kind set to LEGAL_HOLD_RECORD (via a manifest category column or the Sources page) it is retained as required. A name alone gives possible matches, including a different person with the same name. Explained what OpenSanctions tests well (real messy identifiers, the name-versus-ID safeguards, retention of screening data) and what it cannot test (deletion), with download, manifest, CLI and UI steps and the current gaps: date of birth is not used, plural column names are not linked, there is no fuzzy or transliterated name matching, and the kind of data varies by row until it is set per file.
+
+Actions:
+* Built a mock targets.simple.csv in /tmp (not in the repo); ran code/main.py scan three ways
+* Appended this entry to log.txt
+
+Context:
+tool=Claude Code
+model=claude-opus-5-5
+branch=work
+repo_root=/home/user/GhostTrace-Hackerrank
+worktree=main
+parent_agent=none
