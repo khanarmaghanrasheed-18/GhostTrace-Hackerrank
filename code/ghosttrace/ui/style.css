@@ -79,6 +79,7 @@ button.active { background: var(--accent); color: #fff; border-color: var(--acce
 button.small { padding: .1rem .45rem; font-size: .78rem; }
 input[type=text], input[type=search], textarea, select { font: inherit; font-size: .9rem; padding: .4rem .55rem; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); max-width: 100%; }
 input.narrow { width: 12rem; }
+input.wide { width: min(36rem, 100%); }
 .toolbar { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; margin: .5rem 0 .75rem; }
 .toolbar input[type=text], .toolbar input[type=search] { flex: 1; min-width: 14rem; }
 .checkform { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: .75rem; align-items: end; }

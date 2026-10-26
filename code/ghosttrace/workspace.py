@@ -2,11 +2,12 @@
 
 Layout:
   <workspace>/sources/        the supplied files, exactly as uploaded
+  <workspace>/folders.json    folders read in place, never copied (for large data)
   <workspace>/sources.json    per-file settings: captured_at, category, store, complete
   <workspace>/checks/         saved check results (JSON)
   <workspace>/policy.csv      optional custom deletion policy
   <workspace>/settings.json   local settings, e.g. whether the AI helper is allowed
-  <workspace>/.cache/         parsed-file cache
+  <workspace>/.cache/         the index of every record (index.sqlite)
 Everything stays on this machine.
 """
 
@@ -18,12 +19,23 @@ import io
 import json
 from pathlib import Path
 import re
+import shutil
+import sys
 import threading
-from typing import Any
+from typing import Any, BinaryIO
 
 from .classify import CATEGORIES, load_policy
 from .readers import Source, iso_time
 from .scanner import load_sources, read_manifest
+from .store import Store
+
+
+def show_progress(name: str, count: int, seconds: float | None = None) -> None:
+    """Progress of reading a new or changed file into the index, on the terminal."""
+    if seconds is None:
+        print(f"\r  reading {name}: {count:,} records", end="", file=sys.stderr, flush=True)
+    else:
+        print(f"\r  read {name}: {count:,} records in {seconds:.0f}s", file=sys.stderr, flush=True)
 
 
 def safe_name(name: str) -> str:
@@ -41,8 +53,9 @@ class Workspace:
         self.cache_dir = self.root / ".cache"
         for folder in (self.sources_dir, self.checks_dir, self.cache_dir):
             folder.mkdir(parents=True, exist_ok=True)
+        self.store = Store(self.cache_dir / "index.sqlite")
         self._sources: list[Source] | None = None
-        self._lock = threading.Lock()   # one reader at a time; OCR is slow and parsed results are cached
+        self._lock = threading.Lock()   # one reader at a time; OCR is slow and the index keeps what was read
 
     # -- files ---------------------------------------------------------------
 
@@ -54,29 +67,88 @@ class Workspace:
         (self.root / "sources.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
         self._sources = None
 
-    def add_source(self, name: str, data: bytes) -> str:
-        name = safe_name(name)
-        target = self.sources_dir / name
+    def new_target(self, name: str) -> Path:
+        target = self.sources_dir / safe_name(name)
         stem, suffix, n = target.stem, target.suffix, 2
         while target.exists():
             target = self.sources_dir / f"{stem} ({n}){suffix}"
             n += 1
+        return target
+
+    def add_source(self, name: str, data: bytes) -> str:
+        target = self.new_target(name)
         target.write_bytes(data)
         self._sources = None
         return target.name
 
+    def add_upload(self, name: str, stream: BinaryIO, length: int) -> str:
+        """Write an upload to disk as it arrives, so a large file never sits in memory."""
+        target = self.new_target(name)
+        with target.open("wb") as out:
+            left = length
+            while left > 0:
+                chunk = stream.read(min(left, 1 << 20))
+                if not chunk:
+                    break
+                out.write(chunk)
+                left -= len(chunk)
+        if left > 0:
+            target.unlink()
+            raise ValueError("the upload was interrupted")
+        self._sources = None
+        return target.name
+
+    def copy_source(self, path: Path) -> str:
+        target = self.new_target(path.name)
+        shutil.copyfile(path, target)
+        self._sources = None
+        return target.name
+
     def remove_source(self, name: str) -> bool:
+        """Delete an uploaded file. Files in linked folders are never deleted; unlink the folder instead."""
+        if "/" in name or "\\" in name:
+            return False
         target = self.sources_dir / safe_name(name)
         if target.is_file() and target.parent == self.sources_dir:
             target.unlink()
             meta = self.meta()
             meta.pop(target.name, None)
             self.save_meta(meta)
+            self.store.prune({s.digest for s in self.sources()})
             return True
         return False
 
+    # -- folders read in place -------------------------------------------------
+
+    def folders(self) -> list[str]:
+        path = self.root / "folders.json"
+        return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else []
+
+    def link_folder(self, folder: str) -> list[str]:
+        path = Path(folder).expanduser().resolve()
+        if not path.exists():
+            raise ValueError(f"no such folder or file: {path}")
+        if path == self.root or self.root in path.parents:
+            raise ValueError("that is inside the workspace itself")
+        if path in self.root.parents:
+            raise ValueError("that folder contains the workspace; link a narrower folder or keep the workspace elsewhere")
+        folders = self.folders()
+        if str(path) not in folders:
+            folders.append(str(path))
+            (self.root / "folders.json").write_text(json.dumps(folders, indent=2), encoding="utf-8")
+            self._sources = None
+        return folders
+
+    def unlink_folder(self, folder: str) -> list[str]:
+        folders = [f for f in self.folders() if f != folder]
+        (self.root / "folders.json").write_text(json.dumps(folders, indent=2), encoding="utf-8")
+        self._sources = None
+        self.store.prune({s.digest for s in self.sources()})
+        return folders
+
     def update_source(self, name: str, changes: dict[str, Any]) -> dict[str, Any]:
-        name = safe_name(name)
+        if name not in {s.name for s in self.sources()}:
+            raise ValueError("unknown source")
         meta = self.meta()
         entry = meta.get(name, {})
         if "captured_at" in changes:
@@ -99,26 +171,42 @@ class Workspace:
         found = read_manifest(path)
         path.unlink()
         meta = self.meta()
-        names = {p.name for p in self.sources_dir.iterdir() if p.is_file()}
         count = 0
-        for name, entry in found.items():
-            if name in names:
-                meta.setdefault(name, {}).update({k: v for k, v in entry.items() if v})
+        for source in self.sources():
+            entry = found.get(Path(source.name).name)
+            if entry:
+                meta.setdefault(source.name, {}).update({k: v for k, v in entry.items() if v})
                 count += 1
         self.save_meta(meta)
         return count
 
     def sources(self) -> list[Source]:
+        """Uploaded files, then the files of each linked folder (named 'folder/relative path')."""
         with self._lock:
             if self._sources is None:
-                self._sources = load_sources([self.sources_dir], self.cache_dir, self.meta(), base=self.sources_dir)
+                meta = self.meta()
+                found = load_sources([self.sources_dir], None, meta, base=self.sources_dir, store=self.store,
+                                     progress=show_progress)
+                used = set()
+                for folder in self.folders():
+                    path = Path(folder)
+                    if not path.exists():
+                        continue
+                    base = path if path.is_dir() else path.parent
+                    prefix, n = base.name or "folder", 2
+                    while prefix in used:   # two linked folders with the same name
+                        prefix, n = f"{base.name} ({n})", n + 1
+                    used.add(prefix)
+                    found += load_sources([path], None, meta, base=base, store=self.store,
+                                          prefix=prefix + "/", progress=show_progress)
+                self._sources = found
             return self._sources
 
     def source_list(self) -> list[dict[str, Any]]:
         meta = self.meta()
         out = []
         for source in self.sources():
-            out.append({**source.summary(), **{"settings": meta.get(source.name, {})}})
+            out.append({**source.summary(), "settings": meta.get(source.name, {}), "linked": "/" in source.name})
         return out
 
     # -- checks --------------------------------------------------------------

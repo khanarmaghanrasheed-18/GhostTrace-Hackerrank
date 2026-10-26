@@ -11,13 +11,16 @@ A check takes a subject (emails, phones, names, IDs) and a set of sources. It:
 Name-only matches are possible matches for a person to review, never proof.
 Unreadable files are listed: nothing found in a file that could not be read
 does not mean the data is gone.
+
+The files are read once into an on-disk index (store.py), so a check looks the
+person's identifiers up there instead of reading every record again.
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
 import csv
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 from pathlib import Path
@@ -31,19 +34,13 @@ from .classify import (CATEGORY_WORDS, belongs_to_subject, category_for, column_
                        load_policy, record_state)
 from .engine import STEP_FOR_TARGET, deletion_intent, judge, order_steps, policy_target
 from .ingest import EMAIL
-from .readers import Record, Source, iso_time, read_source, SUPPORTED
+from .readers import Record, Source, iso_time, SUPPORTED
+from .store import (DOCUMENT_METHODS, HEX, OCR_METHODS, PHONE, Store, entity_key, indexed_token, page_of,
+                    phone_key)
 from .validate import OPERATIONS
 
-PHONE = re.compile(r"\+?\d[\d\s().\-]{6,}\d")
-HEX = re.compile(r"\b(?:[0-9a-f]{64}|[0-9a-f]{40}|[0-9a-f]{32})\b", re.I)
-OCR_METHODS = {"ocr", "pdf_ocr"}
 OCR_LINK_CONFIDENCE = 0.8   # identifiers read by OCR below this are only suggested
-# A search screen that found nothing: "No customer found", "0 results", "User not found".
-NO_RESULT = re.compile(r"\b(?:no|0|zero)\s+(?:matching\s+)?(?:results?|records?|matches|customers?|users?|accounts?|"
-                       r"profiles?|members?|contacts?|people|persons?|entries)\b(?!\s+(?:yet|selected))|"
-                       r"\b(?:customer|user|account|record|profile|member|contact|person)\s+(?:was\s+)?not\s+found\b|"
-                       r"\bnothing\s+found\b|\bno\s+match\s+found\b", re.I)
-KEY_FIELDS = ("resource_id", "record_id", "id", "uuid", "ticket_id", "order_id", "invoice_id", "export_id")
+MAX_POSSIBLE = 50           # possible matches listed one by one; the rest are counted
 VERDICTS = {
     "STILL_EXISTS": "Personal data still exists",
     "NEEDS_REVIEW": "No confirmed remaining data, but some items need a person to review",
@@ -224,7 +221,6 @@ HISTORY_OLD = ("old_value", "previous_value", "before", "from_value", "old")
 HISTORY_NEW = ("new_value", "current_value", "after", "to_value", "new")
 PROFILE_KINDS = {"USER_PROFILE", "ACCOUNT_TOMBSTONE", "SECONDARY_IDENTIFIER"}
 ANONYMIZE_KINDS = {"ANALYTICS_PROFILE", "PRODUCT_TELEMETRY"}
-DOCUMENT_METHODS = {"ocr", "pdf_text", "pdf_ocr", "docx", "pptx"}
 PLAIN_IDENTIFIER_COLUMNS = {"email", "e_mail", "email_address", "phone", "mobile", "phone_number", "user_id",
                             "customer_id", "email_hash", "uid", "member_id", "client_id", "account_id"}
 
@@ -278,10 +274,15 @@ def linked_identifiers(record: Record, category: str, finding_id: str) -> list[I
 # Sources.
 
 def collect_files(paths: list[Path]) -> list[Path]:
+    """Every file under the given folders, skipping hidden files and folders (.cache, .git),
+    which is also where GhostTrace keeps its own index."""
     files = []
     for path in paths:
         if path.is_dir():
-            files.extend(p for p in sorted(path.rglob("*")) if p.is_file() and not p.name.startswith("."))
+            for found in sorted(path.rglob("*")):
+                hidden = any(part.startswith(".") for part in found.relative_to(path).parts)
+                if found.is_file() and not hidden:
+                    files.append(found)
         elif path.is_file():
             files.append(path)
     return files
@@ -313,12 +314,17 @@ def source_meta(meta: dict[str, dict[str, Any]], name: str) -> dict[str, Any]:
 
 
 def load_sources(paths: list[Path], cache_dir: Path | None, meta: dict[str, dict[str, Any]] | None = None,
-                 base: Path | None = None) -> list[Source]:
+                 base: Path | None = None, store: Store | None = None, prefix: str = "",
+                 progress: Any = None) -> list[Source]:
+    """Sources for every file, read into the index at cache_dir/index.sqlite (in memory without a cache_dir).
+    Names are relative to base when given, and start with prefix."""
+    if store is None:
+        store = Store(cache_dir / "index.sqlite" if cache_dir else None)
     sources = []
     for path in collect_files(paths):
-        name = str(path.relative_to(base)) if base and path.is_relative_to(base) else path.name
+        name = prefix + (path.relative_to(base).as_posix() if base and path.is_relative_to(base) else path.name)
         stated = iso_time(source_meta(meta or {}, name).get("captured_at", ""))
-        source = read_source(path, name=name, cache_dir=cache_dir, captured_at=stated)
+        source = store.source(path, name, stated, progress)
         source.notes.insert(0, "capture time stated" if stated else
                             "capture time unknown; using the file's modified time")
         sources.append(source)
@@ -342,25 +348,32 @@ def run_check(sources: list[Source], check: Check) -> dict[str, Any]:
     as_of = iso_time(check.as_of) if check.as_of else ""
     usable = [s for s in sources if not as_of or s.captured_at <= as_of]
     later_sources = [s.name for s in sources if s not in usable]
-    # 1-2. Match, then follow links until no new identifier appears.
+    # 1-2. Match, then follow links until no new identifier appears. Each identifier is
+    # looked up in the index once; the records found so far are matched again each round.
     no_result = no_result_pages(usable)
     rounds = 0
+    pool: dict[tuple[int, int], tuple[Source, Record]] = {}
+    asked: set[str] = set()
     matches: dict[tuple[str, str], tuple[Record, Source, list[Match]]] = {}
     while True:
         rounds += 1
         hashes = subject.hashes()
+        for position, record_id, source, record in candidates(usable, subject, hashes, asked):
+            pool[(position, record_id)] = (source, record)
         matches = {}
-        for source in usable:
-            for record in source.records:
-                if as_of and record.observed_at and record.observed_at > as_of:
-                    continue
-                found = match_record(record, subject, hashes)
-                if found:
-                    matches[(source.name, record.location)] = (record, source, found)
+        for key in sorted(pool):   # source order, then file order
+            source, record = pool[key]
+            if as_of and record.observed_at and record.observed_at > as_of:
+                continue
+            found = match_record(record, subject, hashes)
+            if found:
+                matches[(source.name, record.location)] = (record, source, found)
+        shared = shared_identifiers(matches, check.meta)
         added = False
         for record, source, found in matches.values():
-            if not any(m.strength == "strong" for m in found):
-                continue
+            strong = [m for m in found if m.strength == "strong"]
+            if not strong or all(m.identifier in shared for m in strong):
+                continue   # a value on several people's records says nothing about whose record this is
             place = page_of(record.location) if record.method in DOCUMENT_METHODS else record.location
             if record.method in OCR_METHODS and (source.name, place) in no_result:
                 continue   # values typed into a search box are not stored data
@@ -370,8 +383,20 @@ def run_check(sources: list[Source], check: Check) -> dict[str, Any]:
         if not added or rounds >= 6:
             break
     hashes = subject.hashes()
+    for record, source, found in matches.values():
+        strong = [m for m in found if m.strength == "strong"]
+        if strong and all(m.identifier in shared for m in strong):
+            for match in strong:
+                match.strength = "weak"
+                match.how += "; the same value is on records of other people"
     add_trace_matches(usable, matches)
     matches = group_documents(matches)
+    # Name-only and other possible matches can run into thousands in a large customer
+    # base; the first ones are listed and the rest counted.
+    possible = [key for key, (_, _, found) in matches.items() if not any(m.strength == "strong" for m in found)]
+    possible.sort(key=lambda key: all(m.kind == "name" for m in matches[key][2]))   # name-only ones last
+    for key in possible[MAX_POSSIBLE:]:
+        del matches[key]
     # 3. Findings, one per matched record, with the latest state per stored copy.
     findings = []
     for n, ((source_name, _), (record, source, found)) in enumerate(sorted(matches.items()), 1):
@@ -421,36 +446,123 @@ def run_check(sources: list[Source], check: Check) -> dict[str, Any]:
     mark_superseded(findings, usable, check.meta)
     for finding in findings:
         decide(finding)
-    return assemble(sources, usable, later_sources, subject, findings, as_of, rules, rounds)
+    result = assemble(sources, usable, later_sources, subject, findings, as_of, rules, rounds)
+    unlisted = max(len(possible) - MAX_POSSIBLE, 0)
+    result["counts"]["possible_not_listed"] = unlisted
+    result["counts"]["needs_review"] += unlisted
+    return result
+
+
+def shared_identifiers(matches: dict, meta: dict[str, dict[str, Any]]) -> set[str]:
+    """Phone numbers found on the profile rows of different people. Together those rows hold
+    more than one email address, and no ID is on all of them: a household phone, a company
+    switchboard or a placeholder number, which is not proof of who a record belongs to."""
+    rows: dict[str, list[Record]] = defaultdict(list)
+    for record, source, found in matches.values():
+        category, _ = category_for(record, source_meta(meta, source.name).get("category", ""))
+        if category in PROFILE_KINDS:
+            for match in found:
+                if match.strength == "strong" and match.kind == "phone":
+                    rows[match.identifier].append(record)
+    shared = set()
+    for key, records in rows.items():
+        if len(records) < 2:
+            continue
+        emails: set[str] = set()
+        common: set[str] | None = None
+        for record in records:
+            ids = set()
+            for column, value in record.fields.items():
+                kind = column_kind(column)
+                if kind == "email":
+                    emails.update(norm_email(e) for e in EMAIL.findall(value))
+                elif kind == "id":
+                    ids.add(value.strip().lower())
+            common = ids if common is None else common & ids
+        if len(emails) > 1 and not common:
+            shared.add(key)
+    return shared
+
+
+def in_files(sources: list[Source], found: list[tuple[str, int, Record]]) -> list[tuple[int, int, Source, Record]]:
+    """Index results as (source position, record ID, source, record), in source order and
+    then file order. Identical files share one index entry, so each gets its own copy."""
+    by_digest: dict[str, list[tuple[int, Source]]] = defaultdict(list)
+    for position, source in enumerate(sources):
+        by_digest[source.digest].append((position, source))
+    out = []
+    for digest, record_id, record in found:
+        for position, source in by_digest[digest]:
+            out.append((position, record_id, source, replace(record, source=source.name)))
+    out.sort(key=lambda item: (item[0], item[1]))
+    return out
+
+
+def candidates(sources: list[Source], subject: Subject, hashes: dict[str, tuple[Identifier, str]],
+               asked: set[str]) -> list[tuple[int, int, Source, Record]]:
+    """Records that may hold one of the subject's identifiers not looked up before (asked
+    keeps those that were); match_record decides which of them match."""
+    if not sources:
+        return []
+    keys, phrases = [], []
+
+    def new(key: str) -> bool:
+        if key in asked:
+            return False
+        asked.add(key)
+        return True
+
+    for item in subject.active("email"):
+        for key in ("e:" + item.norm, "o:email"):   # o:email: OCR text with an email, for near-miss readings
+            if new(key):
+                keys.append(key)
+    for item in subject.active("phone"):
+        if new("p:" + phone_key(item.norm)):
+            keys.append("p:" + phone_key(item.norm))
+    for digest in hashes:
+        if new("h:" + digest):
+            keys.append("h:" + digest)
+    for item in subject.active("id"):
+        if indexed_token(item.norm):
+            if new("t:" + item.norm):
+                keys.append("t:" + item.norm)
+        elif new("s:" + item.norm):
+            phrases.append([item.norm])   # e.g. "AB/123", "jdoe" or "417": found by text search
+    for item in subject.active("name"):
+        if new("s:" + item.norm):
+            phrases.append(item.norm.split())
+    if not keys and not phrases:
+        return []
+    return in_files(sources, sources[0].store.find({s.digest for s in sources}, keys, phrases))
 
 
 def add_trace_matches(sources: list[Source], matches: dict) -> None:
     """A log line about a resource shares the subject of its trace's lookup line."""
-    for source in sources:
-        traces: dict[str, list[Record]] = defaultdict(list)
-        for record in source.records:
-            if record.fields.get("trace_id"):
-                traces[record.fields["trace_id"]].append(record)
-        for trace, records in traces.items():
-            hit = [r for r in records if (source.name, r.location) in matches]
-            if not hit:
-                continue
-            first = matches[(source.name, hit[0].location)][2][0]
-            for record in records:
-                if (source.name, record.location) not in matches and record.fields.get("resource_id"):
-                    matches[(source.name, record.location)] = (record, source, [Match(
-                        first.identifier, first.kind, "trace_id", "strong",
-                        f"same trace {trace} as {hit[0].location}", trace)])
+    done = set()
+    for record, source, found in list(matches.values()):
+        trace = record.fields.get("trace_id")
+        if not trace or (source.name, trace) in done:
+            continue
+        done.add((source.name, trace))
+        records = [replace(r, source=source.name) for r in source.store.trace(source.digest, trace)]
+        hit = [r for r in records if (source.name, r.location) in matches]
+        if not hit:
+            continue
+        first = matches[(source.name, hit[0].location)][2][0]
+        for other in records:
+            if (source.name, other.location) not in matches and other.fields.get("resource_id"):
+                matches[(source.name, other.location)] = (other, source, [Match(
+                    first.identifier, first.kind, "trace_id", "strong",
+                    f"same trace {trace} as {hit[0].location}", trace)])
 
 
 def no_result_pages(sources: list[Source]) -> dict[tuple[str, str], str]:
     """Screenshot pages that show a search finding nothing, with the message shown."""
     pages: dict[tuple[str, str], str] = {}
-    for source in sources:
-        for record in source.records:
-            if record.method in OCR_METHODS and record.text:
-                if NO_RESULT.search(record.text):
-                    pages.setdefault((source.name, page_of(record.location)), record.text[:160])
+    if sources:
+        found = sources[0].store.find({s.digest for s in sources}, ["o:no-result"])
+        for _, _, source, record in in_files(sources, found):
+            pages.setdefault((source.name, page_of(record.location)), record.text[:160])
     return pages
 
 
@@ -467,16 +579,6 @@ def only_searched_values(record: Record, subject: Subject, hashes: dict[str, tup
     return all(norm_email(email) in known for email in EMAIL.findall(record.text))
 
 
-def page_of(location: str) -> str:
-    """'page 2, line 14' -> 'page 2'; screenshot and document lines -> the whole file."""
-    match = re.match(r"(page \d+)", location)
-    if match:
-        return match.group(1)
-    if location.startswith("slide"):
-        return location.split(",")[0]
-    return "whole document" if not location.startswith("OCR") else "whole image"
-
-
 def group_documents(matches: dict) -> dict:
     """One finding per document page instead of one per line of text."""
     grouped: dict[tuple[str, str], tuple[Record, Source, list[Match]]] = {}
@@ -487,12 +589,12 @@ def group_documents(matches: dict) -> dict:
         place = page_of(record.location)
         gkey = (source.name, place)
         if gkey not in grouped:
-            page_text = [r.text for r in source.records if page_of(r.location) == place and r.text]
-            form = next((r.fields for r in source.records if page_of(r.location) == place
-                         and r.location.endswith("form fields")), {})
+            page = source.store.page(source.digest, place)
+            page_text = [r.text for r in page if r.text]
+            form = next((r.fields for r in page if r.location.endswith("form fields")), {})
             merged = Record(source.name, place, record.container, dict(form), text="\n".join(page_text)[:4000],
                             method=record.method, observed_at=record.observed_at,
-                            confidence=min(r.confidence for r in source.records if page_of(r.location) == place))
+                            confidence=min([r.confidence for r in page] or [record.confidence]))
             grouped[gkey] = (merged, source, [])
         for match in found:
             match.column = f"{match.column} ({record.location})" if match.column == "text" else match.column
@@ -505,14 +607,6 @@ def group_documents(matches: dict) -> dict:
                 best[match.identifier] = match
         found[:] = list(best.values())
     return grouped
-
-
-def entity_key(record: Record) -> str:
-    lowered = {k.lower().split(".")[-1]: v for k, v in record.fields.items()}
-    for name in KEY_FIELDS:
-        if lowered.get(name):
-            return f"{name}={lowered[name]}"
-    return record.location
 
 
 def mark_superseded(findings: list[dict[str, Any]], sources: list[Source], meta: dict[str, dict[str, Any]]) -> None:
@@ -538,7 +632,7 @@ def mark_superseded(findings: list[dict[str, Any]], sources: list[Source], meta:
         for snapshot in sorted(complete.get(store, []), key=lambda s: s.captured_at):
             if snapshot.captured_at <= latest["observed_at"] or latest["source"] == snapshot.name:
                 continue
-            present = any(entity_key(r) == entity for r in snapshot.records)
+            present = snapshot.store.has_entity(snapshot.digest, entity)
             if not present and not entity.startswith(("row ", "line ", "sheet ", "table ", "page ")):
                 latest["absent_in"] = {"source": snapshot.name, "captured_at": snapshot.captured_at}
 
@@ -577,7 +671,7 @@ def assemble(sources: list[Source], usable: list[Source], later: list[str], subj
     compliant = [f for f in current if f["verdict"] == "compliant"]
     claims = [f for f in current if f["verdict"] == "claim"]
     unbacked = claims if not compliant else []   # a form's "not found" with no stored evidence behind it
-    unreadable = [s.name for s in usable if s.errors and not s.records]
+    unreadable = [s.name for s in usable if s.errors and not s.count]
     paths = recreation_paths(current)
     if violations or paths:
         status = "STILL_EXISTS"
@@ -593,7 +687,7 @@ def assemble(sources: list[Source], usable: list[Source], later: list[str], subj
         "status": status, "status_text": VERDICTS[status], "as_of": as_of,
         "subject": subject.describe(),
         "suggested_identifiers": [i.as_dict() for i in subject.items.values() if i.origin == "suggested"],
-        "counts": {"sources": len(sources), "sources_used": len(usable), "records_scanned": sum(len(s.records) for s in usable),
+        "counts": {"sources": len(sources), "sources_used": len(usable), "records_scanned": sum(s.count for s in usable),
                    "findings": len(current), "still_exists": len(violations), "compliant": len(compliant),
                    "needs_review": len(unknown) + len(possible) + len(unbacked), "claims": len(claims),
                    "history": len(findings) - len(current),
@@ -729,7 +823,7 @@ def build_timeline(result: dict[str, Any], sources: list[Source]) -> list[dict[s
     for source in sources:
         if source.name in involved:
             entries.append({"time": source.captured_at, "type": "source captured", "source": source.name,
-                            "what": f"{source.name} captured ({len(source.records)} records)", "captured_at": ""})
+                            "what": f"{source.name} captured ({source.count} records)", "captured_at": ""})
     for finding in result["findings"]:
         what = f"{finding['id']} {finding['category']}: {finding['state']} ({finding['state_reason']})"
         if finding.get("superseded_by"):

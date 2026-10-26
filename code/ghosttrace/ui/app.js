@@ -113,6 +113,7 @@ async function dashboard() {
 
 async function sourcesPage() {
   const list = await api("/api/sources");
+  const folders = (await api("/api/folders")).folders;
   await refreshStatus();
   const status = h("div", {class: "upload-status"});
   const input = h("input", {type: "file", multiple: "multiple", id: "files"});
@@ -151,15 +152,29 @@ async function sourcesPage() {
     const complete = h("input", {type: "checkbox"});
     complete.checked = Boolean(settings.complete);
     complete.addEventListener("change", () => save({complete: complete.checked}));
-    const remove = h("button", {type: "button", class: "danger", text: "Remove", onclick: async () => {
-      if (confirm(`Remove ${s.name} from the workspace?`)) { await post("/api/sources/delete", {name: s.name}); route(); }}});
+    const remove = s.linked ? h("span", {class: "muted small", text: "in a linked folder"}) :
+      h("button", {type: "button", class: "danger", text: "Remove", onclick: async () => {
+        if (confirm(`Remove ${s.name} from the workspace?`)) { await post("/api/sources/delete", {name: s.name}); route(); }}});
     const problems = [...s.errors.map(e => h("div", {class: "bad small", text: e})), ...s.notes.map(n => h("div", {class: "muted small", text: n}))];
     return h("tr", {}, [h("td", {text: s.name}), h("td", {text: s.kind}), h("td", {text: s.records.toLocaleString()}),
       h("td", {}, [when]), h("td", {}, [category]), h("td", {}, [store]), h("td", {}, [complete]),
       h("td", {}, problems), h("td", {}, [remove])]);
   });
+  const folderPath = h("input", {type: "text", placeholder: "e.g. D:\\exports or /data/exports", class: "wide"});
+  const folderStatus = h("div", {class: "upload-status"});
+  const linkButton = h("button", {type: "button", text: "Read this folder", onclick: async () => {
+    if (!folderPath.value.trim()) return;
+    folderStatus.textContent = "Reading the folder into the index. Large files take a while; progress is shown in the terminal…";
+    try { await post("/api/folders", {path: folderPath.value.trim()}); route(); }
+    catch (err) { folderStatus.textContent = ""; folderStatus.append(errorBox(err)); }
+  }});
+  const folderRows = folders.map(f => [f, h("button", {type: "button", text: "Stop reading", onclick: async () => {
+    await post("/api/folders/remove", {path: f}); route(); }})]);
   return h("div", {}, [
     h("h1", {text: "Sources"}),
+    section("Folders read in place (for large data)", [h("div", {class: "toolbar"}, [folderPath, linkButton]), folderStatus,
+      folderRows.length ? table(["Folder", ""], folderRows) : h("p", {class: "muted", text: "No linked folders."})],
+      "Big database files and exports do not need to be copied. GhostTrace reads the folder where it is, once, into a local index, and reads a file again only when it changes. Your files are never modified or deleted."),
     section("Add files", [drop, status, h("p", {class: "small", text: "Files are copied into the local workspace and never uploaded anywhere."}),
       h("details", {}, [h("summary", {text: "Import capture times from a manifest CSV"}),
         h("p", {class: "small muted", text: "A CSV with a file_path (or file/name) column and a captured_at column. Capture time decides which files count for a check 'as of' a date; without it the file's modified time is used."}),
@@ -356,6 +371,7 @@ async function resultPage(id) {
       card("Needs review", r.counts.needs_review, "possible matches, unknown states, form claims", r.counts.needs_review ? "warn" : ""),
       card("Recreation paths", r.recreation_paths.length, "sync or restore processes that can bring data back", r.recreation_paths.length ? "bad" : ""),
       card("Records scanned", r.counts.records_scanned.toLocaleString(), `${r.counts.sources_used} of ${r.counts.sources} sources`)]),
+    r.counts.possible_not_listed ? h("div", {class: "notice warn", text: `${r.counts.possible_not_listed.toLocaleString()} more records match only by name or by a shared phone number and are not listed one by one. Add an email, phone or ID to narrow the check.`}) : null,
     h("div", {class: "toolbar"}, [h("a", {class: "button", href: `/api/checks/${id}/export.csv`, text: "Download findings (CSV)"}),
       h("button", {type: "button", text: "Download full result (JSON)", onclick: () => download(`${id}.json`, JSON.stringify(saved, null, 2), "application/json")}),
       h("button", {type: "button", class: "danger", text: "Delete this result", onclick: async () => { if (confirm("Delete this saved result?")) { await post("/api/checks/delete", {id}); location.hash = "#/dashboard"; } }})]),

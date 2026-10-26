@@ -30,6 +30,7 @@ from ghosttrace.gemini import GeminiInterpreter
 from ghosttrace.ingest import read_csv
 from ghosttrace.validate import validate_file
 from ghosttrace.views import case_graph, case_timeline, render_graph, render_timeline
+from ghosttrace.workspace import show_progress
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -72,6 +73,8 @@ def main() -> int:
     serve_cmd.add_argument("--workspace", default="ghosttrace_workspace", help="folder for files, results and settings")
     serve_cmd.add_argument("--port", type=int, default=8765)
     serve_cmd.add_argument("--add", nargs="*", default=[], help="files or folders to copy into the workspace first")
+    serve_cmd.add_argument("--link", nargs="*", default=[],
+                           help="folders to read in place without copying them (best for large data)")
     serve_cmd.add_argument("--manifest", help="CSV with file_path and captured_at for the added files")
     serve_cmd.add_argument("--open", action="store_true", help="open the browser")
     scan = sub.add_parser("scan", help="check whether one person's data still exists in files or folders")
@@ -180,7 +183,8 @@ def main() -> int:
 
 
 def cache_dir() -> Path:
-    return Path.cwd() / ".cache" / "ghosttrace" / "readers"
+    """Where the command line keeps its index of the files it has read."""
+    return Path.cwd() / ".cache" / "ghosttrace"
 
 
 def run_serve(args: argparse.Namespace) -> int:
@@ -191,7 +195,9 @@ def run_serve(args: argparse.Namespace) -> int:
     for item in args.add:
         for path in scanner.collect_files([Path(item)]):
             if path.name not in existing:   # adding the same folder again does not duplicate files
-                workspace.add_source(path.name, path.read_bytes())
+                workspace.copy_source(path)
+    for item in args.link:
+        workspace.link_folder(item)
     if args.manifest:
         print(f"Capture times read for {workspace.import_manifest(Path(args.manifest).read_bytes())} files.")
     serve(workspace, ROOT, args.port, args.open)
@@ -202,7 +208,7 @@ def run_scan(args: argparse.Namespace) -> int:
     meta = scanner.read_manifest(Path(args.manifest)) if args.manifest else {}
     paths = [Path(p) for p in args.sources]
     base = paths[0] if len(paths) == 1 and paths[0].is_dir() else None
-    sources = scanner.load_sources(paths, cache_dir(), meta, base=base)
+    sources = scanner.load_sources(paths, cache_dir(), meta, base=base, progress=show_progress)
     subject = scanner.Subject(args.email, args.phone, args.name, args.id, confirmed=args.confirm, rejected=args.reject)
     if not subject.items:
         print("Give at least one --email, --phone, --name or --id.")
@@ -240,6 +246,8 @@ def render_scan(result: dict) -> str:
     for path in result["recreation_paths"]:
         out.append(f"  RECREATION {path['process']} {path['kind']} {path['state']} -> can bring back "
                    f"{', '.join(path['can_recreate']) or 'nothing identified'} ({path['basis']})")
+    if c.get("possible_not_listed"):
+        out.append(f"  ... and {c['possible_not_listed']:,} more possible matches (name only or a shared phone), not listed")
     if result["coverage"]["unreadable"]:
         out.append(f"\nNOT READABLE (not checked): {', '.join(result['coverage']['unreadable'])}")
     if result["plan"]:
@@ -254,7 +262,7 @@ def run_batch(args: argparse.Namespace) -> int:
     meta = scanner.read_manifest(Path(args.manifest)) if args.manifest else {}
     paths = [Path(p) for p in args.sources]
     base = paths[0] if len(paths) == 1 and paths[0].is_dir() else None
-    sources = scanner.load_sources(paths, cache_dir(), meta, base=base)
+    sources = scanner.load_sources(paths, cache_dir(), meta, base=base, progress=show_progress)
     rows = read_csv(Path(args.requests))
     results = scanner.batch(sources, rows, Path(args.policy) if args.policy else None, meta)
     text = batch_csv(results)

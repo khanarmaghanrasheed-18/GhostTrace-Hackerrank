@@ -14,7 +14,9 @@ Give it the files and the person's email, phone, name or ID. It tells you:
 - **how to finish the job**: an ordered cleanup plan that stops processes first, then deletes, redacts or anonymizes, then verifies, while keeping what must be kept (invoices, security logs, legal holds);
 - **what a cleanup idea would achieve** before anyone touches a system (what-if analysis).
 
-It runs entirely on your computer. Nothing is uploaded and no outside scripts are loaded. The optional AI helper is off until you turn it on.
+It runs entirely on your computer. Nothing is uploaded and no outside scripts are loaded. Checking files never calls an AI service, so there are no credits or per-file costs; the optional AI helper (for what-if questions only) is off until you turn it on.
+
+It is built for large data: each file is read once, row by row, into a local index, so millions of rows fit on an ordinary computer.
 
 ---
 
@@ -45,12 +47,42 @@ The manifest only gives each demo file its capture time; it is optional.
 
 Your files and results live in `./ghosttrace_workspace/`. Use `--workspace PATH` to keep them somewhere else, and `--port` to change the port.
 
+### Large data
+
+Big database files and exports do not need to be copied into the workspace. Link their folders instead. GhostTrace reads them where they are and never changes or deletes them:
+
+```bash
+python3 code/main.py serve --link /data/exports/crm /data/exports/app_db
+# Windows: py code/main.py serve --link D:\exports\crm D:\exports\app_db
+```
+
+You can also add a folder on the **Sources** page.
+
+How it works:
+
+- Each file is read once, row by row, into a local index (`<workspace>/.cache/index.sqlite`).
+- A file is read again only when it changes. Progress is shown in the terminal.
+- A check looks the person up in the index instead of reading every row again.
+- Nothing is cut off: every row of every table is read.
+
+Measured with a fictional company database of 5 million rows (four tables, 463 MB) on a 4-core cloud machine:
+
+| | |
+| --- | --- |
+| First read into the index | about 7 minutes (about 12,000 rows a second); later starts are instant |
+| Index size on disk | 1.9 GB |
+| A check by email, phone or ID | under 6 seconds, including following the person's links |
+| A check by name only | about 4 seconds |
+| Memory used | under 60 MB |
+
+A check takes the same few seconds no matter how many people you check in a batch, one after another.
+
 ## Using the app
 
 | Page | What you do there |
 | --- | --- |
 | **Dashboard** | Totals for sources, unreadable files and checks by verdict, plus the kinds of data most often left behind. |
-| **Sources** | Drop in files of any supported type. For each file you can set when it was captured, correct the guessed *kind of data*, group several files as copies of one *store*, and mark a file as a *complete snapshot*. |
+| **Sources** | Drop in files of any supported type, or link a folder to read it in place. For each file you can set when it was captured, correct the guessed *kind of data*, group several files as copies of one *store*, and mark a file as a *complete snapshot*. |
 | **New check** | Enter emails, phones, names and IDs (any mix), and optionally "as of" a date. |
 | **Result** | Verdict, where the data still exists, every finding with its evidence, the graph, the timeline, the cleanup plan, what-if, identifiers, coverage, and the policy used. Download the findings as CSV or the whole result as JSON. |
 | **Batch** | Upload a CSV of requests (email / phone / name / user_id / request_text) and get one verdict per row as a table and a CSV. |
@@ -94,6 +126,8 @@ Options:
 - `--policy rules.csv` uses your own rules.
 - `--manifest files.csv` gives capture times.
 
+The command line keeps its index in `./.cache/ghosttrace/index.sqlite`, so a second check on the same files is quick.
+
 ## Supported inputs
 
 | Kind | Files |
@@ -105,17 +139,21 @@ Options:
 | Images | `.png`, `.jpg`, `.jpeg`, `.tif`, `.tiff`, `.bmp`, `.gif`, `.webp`, read by OCR with a confidence for each line |
 | Archives | `.zip`, whose members are read with the same rules |
 
+Spreadsheets, databases, SQL dumps, JSON Lines and text or log files of any size are read row by row. Formats that have to be parsed whole (JSON, XML, HTML, Office files, PDFs, email and images) are limited to 300 MB each; save a large JSON export as JSON Lines.
+
 Files that cannot be read (old binary `.xls`, damaged files, a missing OCR tool) are listed under **Coverage**, and a clean verdict is never given while they remain unread.
 
 ## How GhostTrace decides
 
 1. **Finding the person.**
    - **Proof:** an exact email (in any letter case), a phone number in any format (matched on the last 9 digits), an ID, or a SHA-256, SHA-1 or MD5 hash of their email or phone.
-   - **Never proof:** a name only gives a *possible match*. A near-miss email in OCR text ("exampIe.com") is also only *possible*.
+   - **Never proof:** a name only gives a *possible match*. A near-miss email in OCR text ("exampIe.com") is also only *possible*. So is a phone number found on the profiles of different people (a household, switchboard or placeholder number): GhostTrace never follows it to other people's records.
+   - A check lists at most 50 possible matches one by one and counts the rest. A common name in a large customer base can match thousands of strangers.
 2. **Following links it can prove.**
    - **Used automatically:** the other identifiers on a matched *profile* row, and both values of an *identity-change* row (old and new email).
    - **Suggested for you to confirm:** values that merely sit next to the person's data, such as a phone on a support ticket.
    - **Never linked:** staff columns such as `agent_email` or `author_email`.
+   - **Screenshots of forms:** `Label: value` lines (and common labels such as `Customer ID   C-10442`) are read as fields, so a details screen links the IDs it shows. Values read by OCR below 80% confidence are only suggested.
 3. **Kind of data.** Every match is classified from the following, in order:
    - a `record_type` field;
    - your choice for the file;
@@ -128,6 +166,7 @@ Files that cannot be read (old binary `.xls`, damaged files, a missing OCR tool)
    - The latest observation of the same stored copy wins.
    - A row marked `deleted` that still holds the data is a *soft delete*, so the data still exists.
    - A lookup that reports "not found" is evidence of absence.
+   - A screenshot of a search that found nothing ("No customer found") is only the form's *claim*: a form shows what its query selects and can hide rows marked deleted. On its own it gives *Needs review*. The database files or exports behind the form decide.
    - A missing row proves removal only from a file you marked as a complete snapshot.
 5. **Policy.** The default policy (`code/ghosttrace/policy/default_policy.csv`) says:
    - **delete:** profiles, search entries, exports, marketing data, attachments;
@@ -163,6 +202,7 @@ Files that cannot be read (old binary `.xls`, damaged files, a missing OCR tool)
 ```text
 code/main.py                  command line: serve, scan, batch-check, and the benchmark commands
 code/ghosttrace/readers.py    readers for every supported file type
+code/ghosttrace/store.py      the on-disk index: each file read once, people looked up by identifier
 code/ghosttrace/classify.py   kind of data, state, identifier columns, policy loading
 code/ghosttrace/scanner.py    matching, identity links, findings, verdict, plan, graph, timeline, what-if, batch
 code/ghosttrace/workspace.py  the local workspace (files, settings, saved results, custom policy)
@@ -170,7 +210,7 @@ code/ghosttrace/server.py     local web server and JSON API
 code/ghosttrace/ui/           dashboard and graph explorer (plain HTML, CSS, JavaScript)
 code/ghosttrace/ingest.py, identity.py, engine.py, graph.py, views.py, whatif.py
                               the benchmark audit engine for the Northstar dataset
-code/evaluation/              tests (63) and the benchmark evaluator
+code/evaluation/              tests (73) and the benchmark evaluator
 examples/                     fictional Acme Outdoor demo, its manifest and a batch request file
 docs/PLAN.md                  architecture decisions and status
 ```
@@ -211,6 +251,8 @@ The original challenge statement is kept in [`problem_statement.md`](./problem_s
 ## Limitations
 
 - GhostTrace sees only the files you give it. "No trace found" means nothing was found in those files, not that no copy exists anywhere.
+- It reads files, not live database servers. Export MySQL, PostgreSQL or SQL Server tables (an SQL dump, or CSV/Excel per table) and link the folder.
+- The index needs disk space, about four times the size of a table export, and the first read of a large file takes a while.
 - OCR can misread characters. Near-misses are shown as possible matches, and each OCR line keeps its confidence.
 - The kind of data is guessed from names. Correct it per file on the Sources page when the guess is wrong.
 - A sync's destination is read from its configured destination or name. If neither says, the destination is reported as unknown. Backup contents are not itemized, so any archived database or file record is treated as recoverable.

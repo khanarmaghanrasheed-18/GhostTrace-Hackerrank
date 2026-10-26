@@ -282,6 +282,89 @@ class DemoCheckTests(unittest.TestCase):
         self.assertEqual(len(everything["accepted"]), len(plan_actions))
 
 
+class LargeDataTests(unittest.TestCase):
+    """The on-disk index: no record limit, reuse, archives, dumps, text search, shared values."""
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp(prefix="ghosttrace-large-"))
+        self.index = Path(tempfile.mkdtemp(prefix="ghosttrace-index-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.dir)
+        shutil.rmtree(self.index)
+
+    def check(self, **who) -> dict:
+        sources = scanner.load_sources([self.dir], self.index, {}, base=self.dir)
+        subject = scanner.Subject(who.get("emails", []), who.get("phones", []), who.get("names", []), who.get("ids", []))
+        return scanner.run_check(sources, scanner.Check(subject))
+
+    def test_every_record_is_read_and_the_index_is_reused(self) -> None:
+        conn = sqlite3.connect(self.dir / "big.db")
+        conn.execute("CREATE TABLE a_events (event TEXT)")
+        conn.executemany("INSERT INTO a_events VALUES (?)", (("view",) for _ in range(205_000)))
+        conn.execute("CREATE TABLE customers (customer_id TEXT, email TEXT)")
+        conn.execute("INSERT INTO customers VALUES ('C-77', 'late@example.com')")   # after the old 200,000 limit
+        conn.commit()
+        conn.close()
+        calls = []
+        progress = lambda name, count, seconds=None: calls.append(count)
+        sources = scanner.load_sources([self.dir], self.index, {}, progress=progress)
+        self.assertEqual(sources[0].count, 205_001)
+        result = scanner.run_check(sources, scanner.Check(scanner.Subject(["late@example.com"])))
+        self.assertEqual(result["status"], "STILL_EXISTS")
+        calls.clear()
+        scanner.load_sources([self.dir], self.index, {}, progress=progress)
+        self.assertEqual(calls, [])                                     # unchanged file: not read again
+
+    def test_zip_members_and_sql_dumps(self) -> None:
+        with zipfile.ZipFile(self.dir / "exports.zip", "w") as archive:
+            archive.writestr("march/users.csv", "email\nz@example.com\n")
+            archive.writestr("april/users.csv", "email\nz@example.com\n")
+        (self.dir / "dump.sql").write_text(
+            "BEGIN TRANSACTION;\nCREATE TABLE users (email TEXT, name TEXT);\n"
+            "INSERT INTO users VALUES ('z@example.com', 'Z'); INSERT INTO users VALUES ('q@example.com', 'Q');\n"
+            "COMMIT;\n", encoding="utf-8")
+        result = self.check(emails=["z@example.com"])
+        places = sorted(f"{f['source']} / {f['location']}" for f in result["findings"])
+        self.assertEqual(places, ["dump.sql / table users, row 1", "exports.zip / april/users.csv :: row 2",
+                                  "exports.zip / march/users.csv :: row 2"])
+
+    def test_names_ids_without_digits_and_accents_by_text_search(self) -> None:
+        (self.dir / "notes.csv").write_text("note,ref\nCall from José Álvarez,AB/123\nshort id,417\n", encoding="utf-8")
+        found = self.check(names=["Jose Alvarez"])["findings"]
+        self.assertEqual([f["verdict"] for f in found], ["possible match"])
+        self.assertEqual(len(self.check(ids=["AB/123"])["findings"]), 1)
+        self.assertEqual(len(self.check(ids=["417"])["findings"]), 1)
+
+    def test_a_shared_phone_does_not_merge_people(self) -> None:
+        (self.dir / "customers.csv").write_text(
+            "customer_id,email,phone\nC-1,jane@example.com,+1 555 010 2000\nC-2,omar@example.com,+1 555 010 2000\n",
+            encoding="utf-8")
+        (self.dir / "orders.csv").write_text("order_id,customer_id\nO-9,C-2\n", encoding="utf-8")
+        result = self.check(emails=["jane@example.com"])
+        verdicts = {f["location"]: f["verdict"] for f in result["findings"]}
+        self.assertEqual(verdicts, {"row 2": "violation", "row 3": "possible match"})   # Omar's row is not hers
+        self.assertNotIn("C-2", [i["value"] for i in result["subject"]])
+        alone = self.check(phones=["+1 555 010 2000"])
+        self.assertEqual(alone["status"], "NEEDS_REVIEW")                  # the phone alone cannot tell who
+
+    def test_possible_matches_are_capped(self) -> None:
+        rows = "".join(f"P-{n},person{n}@example.com,Sam Lee\n" for n in range(scanner.MAX_POSSIBLE + 10))
+        (self.dir / "people.csv").write_text("customer_id,email,name\n" + rows, encoding="utf-8")
+        result = self.check(names=["Sam Lee"])
+        self.assertEqual(len(result["findings"]), scanner.MAX_POSSIBLE)
+        self.assertEqual(result["counts"]["possible_not_listed"], 10)
+        self.assertEqual(result["counts"]["needs_review"], scanner.MAX_POSSIBLE + 10)
+
+    def test_an_index_from_an_older_version_is_rebuilt(self) -> None:
+        old = sqlite3.connect(self.index / "index.sqlite")
+        old.execute("CREATE TABLE records (id INTEGER PRIMARY KEY, digest TEXT)")
+        old.commit()
+        old.close()
+        (self.dir / "a.csv").write_text("email\na@example.com\n", encoding="utf-8")
+        self.assertEqual(self.check(emails=["a@example.com"])["status"], "STILL_EXISTS")
+
+
 class TimeAndPolicyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.dir = Path(tempfile.mkdtemp(prefix="ghosttrace-time-"))
@@ -417,6 +500,26 @@ class ServerTests(unittest.TestCase):
         status, headers, data = self.call("GET", f"/api/checks/{check['id']}/export.csv")
         self.assertIn("people.csv", data.decode())
         self.assertEqual(self.call("GET", "/api/checks/..%2F..%2Fsecret")[0], 404)
+
+    def test_linked_folder_is_read_in_place_and_never_deleted(self) -> None:
+        outside = Path(tempfile.mkdtemp(prefix="ghosttrace-linked-"))
+        try:
+            (outside / "crm.csv").write_text("email,name\nlinked@example.com,L\n", encoding="utf-8")
+            status, _, data = self.call("POST", "/api/folders", json.dumps({"path": str(outside)}).encode())
+            self.assertEqual(status, 200)
+            names = {s["name"]: s for s in json.loads(self.call("GET", "/api/sources")[2])}
+            name = f"{outside.name}/crm.csv"
+            self.assertTrue(names[name]["linked"])
+            self.assertFalse((self.dir / "sources" / "crm.csv").exists())   # not copied
+            check = json.loads(self.call("POST", "/api/check", json.dumps({"emails": ["linked@example.com"]}).encode())[2])
+            self.assertEqual(check["result"]["status"], "STILL_EXISTS")
+            deleted = json.loads(self.call("POST", "/api/sources/delete", json.dumps({"name": name}).encode())[2])
+            self.assertFalse(deleted["deleted"])
+            self.assertTrue((outside / "crm.csv").is_file())                 # the user's file stays
+            self.call("POST", "/api/folders/remove", json.dumps({"path": str(outside)}).encode())
+            self.assertNotIn(name, {s["name"] for s in json.loads(self.call("GET", "/api/sources")[2])})
+        finally:
+            shutil.rmtree(outside)
 
 
 if __name__ == "__main__":

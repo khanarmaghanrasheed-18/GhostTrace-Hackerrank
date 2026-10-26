@@ -9,6 +9,10 @@ Supported without extra Python packages:
   archives      .zip (members are read with the same rules)
 PDF and image text needs the command-line tools pdftotext/pdftoppm (poppler-utils)
 and tesseract. A file that cannot be read is reported, never treated as empty.
+
+Tables, SQL, JSON Lines and text are read row by row, so a file of any size can
+be read without holding it in memory. Formats that must be parsed whole (JSON,
+XML, HTML, Office files, PDFs, email, images) are limited to MAX_FILE_BYTES.
 """
 
 from __future__ import annotations
@@ -18,12 +22,12 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from email import policy as email_policy
 from email.parser import BytesParser
-import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -33,8 +37,8 @@ import zipfile
 
 from .ingest import parse_line
 
-MAX_RECORDS_PER_SOURCE = 200_000
-MAX_FILE_BYTES = 300 * 1024 * 1024
+MAX_FILE_BYTES = 300 * 1024 * 1024   # only for formats that are parsed whole
+csv.field_size_limit(2 ** 31 - 1)    # very long cells (notes, JSON blobs) are still read
 
 SPREADSHEET = {".csv", ".tsv", ".xlsx", ".xlsm"}
 DATABASE = {".db", ".sqlite", ".sqlite3", ".sql"}
@@ -43,6 +47,7 @@ DOCUMENT = {".pdf", ".docx", ".pptx", ".eml", ".txt", ".md", ".html", ".htm", ".
 IMAGE = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
 ARCHIVE = {".zip"}
 SUPPORTED = SPREADSHEET | DATABASE | STRUCTURED | DOCUMENT | IMAGE | ARCHIVE
+WHOLE_FILE = {".json", ".xml", ".html", ".htm", ".pdf", ".docx", ".pptx", ".eml"} | IMAGE
 TIME_FIELDS = ("updated_at", "modified_at", "last_modified", "observed_at", "captured_at", "recorded_at",
                "event_time", "timestamp", "time", "date", "created_at")
 ISO_TIME = re.compile(r"\d{4}-\d\d-\d\d(?:[T ]\d\d:\d\d(?::\d\d)?)?")
@@ -75,15 +80,28 @@ class Source:
     kind: str
     size: int
     captured_at: str
-    records: list[Record] = field(default_factory=list)
+    records: list[Record] = field(default_factory=list)   # kept only when there is no sink
     errors: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    count: int = 0
+    containers: list[str] = field(default_factory=list)
+    sink: Any = None      # receives each record instead of the list (the on-disk index)
+    digest: str = ""      # set when the source is in the index
+    store: Any = None
+
+    def add(self, record: Record) -> None:
+        self.count += 1
+        if record.container and record.container not in self.containers:
+            self.containers.append(record.container)
+        if self.sink:
+            self.sink(record)
+        else:
+            self.records.append(record)
 
     def summary(self) -> dict[str, Any]:
-        containers = sorted({r.container for r in self.records if r.container})
         return {"name": self.name, "kind": self.kind, "size": self.size, "captured_at": self.captured_at,
-                "records": len(self.records), "containers": containers, "errors": self.errors,
-                "notes": self.notes, "readable": not self.errors or bool(self.records)}
+                "records": self.count, "containers": sorted(self.containers), "errors": self.errors,
+                "notes": self.notes, "readable": not self.errors or self.count > 0}
 
 
 def file_time(path: Path) -> str:
@@ -119,42 +137,23 @@ def kind_of(path: Path) -> str:
                         ("document", DOCUMENT), ("image", IMAGE), ("archive", ARCHIVE)):
         if suffix in group:
             return kind
-    if path.is_file() and path.read_bytes()[:16].startswith(b"SQLite format 3"):
-        return "database"
+    if path.is_file():
+        with path.open("rb") as handle:
+            if handle.read(16).startswith(b"SQLite format 3"):
+                return "database"
     return "unsupported"
 
 
 # ---------------------------------------------------------------------------
-# Entry point with a digest-keyed cache.
+# Entry points. read_source keeps the records in memory; the index (store.py)
+# gives read_into a sink instead, so large files never sit in memory.
 
-def read_source(path: Path, name: str | None = None, cache_dir: Path | None = None,
-                captured_at: str = "") -> Source:
-    name = name or path.name
-    size = path.stat().st_size
-    source = Source(name, kind_of(path), size, captured_at or file_time(path))
-    if size > MAX_FILE_BYTES:
-        source.errors.append(f"file is larger than {MAX_FILE_BYTES // (1024 * 1024)} MB; split it first")
-        return source
-    cache_file = None
-    if cache_dir:
-        digest = hashlib.sha256(Path(__file__).read_bytes() + path.read_bytes()).hexdigest()
-        cache_file = cache_dir / f"{digest}.json"
-        if cache_file.is_file():
-            data = json.loads(cache_file.read_text(encoding="utf-8"))
-            source.records = [Record(**{**r, "source": name}) for r in data["records"]]
-            source.errors, source.notes = data["errors"], data["notes"]
-            return source
+def read_source(path: Path, name: str | None = None, captured_at: str = "") -> Source:
+    source = Source(name or path.name, kind_of(path), path.stat().st_size, captured_at or file_time(path))
     try:
         read_into(source, path)
     except Exception as exc:   # a broken file must not stop the other sources
         source.errors.append(f"could not read: {type(exc).__name__}: {exc}")
-    if len(source.records) > MAX_RECORDS_PER_SOURCE:
-        source.notes.append(f"only the first {MAX_RECORDS_PER_SOURCE} records were scanned")
-        source.records = source.records[:MAX_RECORDS_PER_SOURCE]
-    if cache_file:
-        cache_file.parent.mkdir(parents=True, exist_ok=True)
-        cache_file.write_text(json.dumps({"records": [r.as_dict() for r in source.records],
-                                          "errors": source.errors, "notes": source.notes}), encoding="utf-8")
     return source
 
 
@@ -163,6 +162,9 @@ def read_into(source: Source, path: Path) -> None:
     if source.kind == "unsupported":
         hint = " (save old .xls files as .xlsx or .csv)" if suffix == ".xls" else ""
         source.errors.append(f"unsupported file type {suffix or 'without extension'}{hint}")
+    elif suffix in WHOLE_FILE and path.stat().st_size > MAX_FILE_BYTES:
+        hint = " (save large JSON as JSON Lines, one object per line)" if suffix == ".json" else "; split it first"
+        source.errors.append(f"file is larger than {MAX_FILE_BYTES // (1024 * 1024)} MB{hint}")
     elif suffix in (".csv", ".tsv"):
         read_csv_file(source, path)
     elif suffix in (".xlsx", ".xlsm"):
@@ -174,9 +176,10 @@ def read_into(source: Source, path: Path) -> None:
     elif suffix == ".json":
         read_json(source, json.loads(path.read_text(encoding="utf-8-sig")))
     elif suffix in (".jsonl", ".ndjson"):
-        for n, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
-            if line.strip():
-                read_json(source, json.loads(line), f"line {n}")
+        with path.open(encoding="utf-8-sig") as handle:
+            for n, line in enumerate(handle, 1):
+                if line.strip():
+                    read_json(source, json.loads(line), f"line {n}")
     elif suffix == ".xml":
         read_xml(source, path)
     elif suffix == ".pdf":
@@ -191,42 +194,54 @@ def read_into(source: Source, path: Path) -> None:
         read_image(source, path)
     elif suffix == ".zip":
         read_zip(source, path)
+    elif suffix in (".html", ".htm"):
+        read_text(source, path.read_text(encoding="utf-8", errors="replace"), html=True)
     else:
-        read_text(source, path.read_text(encoding="utf-8", errors="replace"), html=suffix in (".html", ".htm"))
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            read_lines(source, handle)
 
 
 # ---------------------------------------------------------------------------
 # Tables.
 
-def table_rows(source: Source, rows: list[list[str]], container: str, method: str, place: str) -> None:
-    """Turn a grid into records, using the first non-empty row as column names."""
-    rows = [r for r in rows if any(str(c).strip() for c in r)]
-    if not rows:
-        return
-    header = [str(c).strip() or f"column {n + 1}" for n, c in enumerate(rows[0])]
-    for n, row in enumerate(rows[1:], 2):
+def table_rows(source: Source, rows: Any, container: str, method: str, place: str) -> None:
+    """Turn rows into records, using the first non-empty row as column names.
+    Rows are numbered among the non-empty rows, the header being row 1."""
+    header: list[str] | None = None
+    n = 0
+    for row in rows:
+        if not any(str(c).strip() for c in row):
+            continue
+        n += 1
+        if header is None:
+            header = [str(c).strip() or f"column {i + 1}" for i, c in enumerate(row)]
+            continue
         values = {header[i] if i < len(header) else f"column {i + 1}": str(v).strip()
                   for i, v in enumerate(row) if str(v).strip()}
         if values:
-            source.records.append(Record(source.name, f"{place}row {n}", container, values, method=method,
-                                         observed_at=record_time(values)))
+            source.add(Record(source.name, f"{place}row {n}", container, values, method=method,
+                              observed_at=record_time(values)))
 
 
 def read_csv_file(source: Source, path: Path) -> None:
-    raw = path.read_bytes()
+    encoding = "utf-8-sig"
     try:
-        text = raw.decode("utf-8-sig")
+        with path.open(encoding=encoding) as handle:
+            while handle.read(1 << 20):
+                pass
     except UnicodeDecodeError:
-        text = raw.decode("latin-1")
+        encoding = "latin-1"
         source.notes.append("decoded as Latin-1")
-    delimiter = "\t" if path.suffix.lower() == ".tsv" else ","
-    if delimiter == ",":
-        try:
-            delimiter = csv.Sniffer().sniff(text[:4096], delimiters=",;|\t").delimiter
-        except csv.Error:
-            delimiter = ","
-    rows = list(csv.reader(io.StringIO(text), delimiter=delimiter))
-    table_rows(source, rows, path.stem, "csv", "")
+    with path.open(newline="", encoding=encoding) as handle:
+        sample = handle.read(4096)
+        handle.seek(0)
+        delimiter = "\t" if path.suffix.lower() == ".tsv" else ","
+        if delimiter == ",":
+            try:
+                delimiter = csv.Sniffer().sniff(sample, delimiters=",;|\t").delimiter
+            except csv.Error:
+                delimiter = ","
+        table_rows(source, csv.reader(handle, delimiter=delimiter), path.stem, "csv", "")
 
 
 def xml_tag(element: ElementTree.Element) -> str:
@@ -263,31 +278,43 @@ def read_xlsx(source: Source, path: Path) -> None:
             if member not in names:
                 source.errors.append(f"sheet {sheet_name} is missing from the workbook")
                 continue
-            grid: list[list[str]] = []
-            for row in ElementTree.fromstring(book.read(member)).iter():
-                if xml_tag(row) != "row":
-                    continue
-                values: list[str] = []
-                for cell in row:
-                    if xml_tag(cell) != "c":
-                        continue
-                    index = column_index(cell.get("r", "")) if cell.get("r") else len(values)
-                    while len(values) < index:
-                        values.append("")
-                    kind = cell.get("t", "")
-                    value = ""
-                    for part in cell:
-                        if xml_tag(part) == "v":
-                            value = part.text or ""
-                        elif xml_tag(part) == "is":
-                            value = "".join(t.text or "" for t in part.iter() if xml_tag(t) == "t")
-                    if kind == "s" and value.isdigit() and int(value) < len(shared):
-                        value = shared[int(value)]
-                    elif kind == "b":
-                        value = "TRUE" if value == "1" else "FALSE"
-                    values.append(value)
-                grid.append(values)
-            table_rows(source, grid, sheet_name, "xlsx", f"sheet {sheet_name}, ")
+            with book.open(member) as handle:
+                table_rows(source, sheet_rows(handle, shared), sheet_name, "xlsx", f"sheet {sheet_name}, ")
+
+
+def sheet_rows(handle: Any, shared: list[str]) -> Any:
+    """The rows of one worksheet, parsed as they are read so a large sheet fits in memory."""
+    parent = None
+    for event, element in ElementTree.iterparse(handle, events=("start", "end")):
+        tag = xml_tag(element)
+        if event == "start":
+            if tag == "sheetData":
+                parent = element
+            continue
+        if tag != "row":
+            continue
+        values: list[str] = []
+        for cell in element:
+            if xml_tag(cell) != "c":
+                continue
+            index = column_index(cell.get("r", "")) if cell.get("r") else len(values)
+            while len(values) < index:
+                values.append("")
+            kind = cell.get("t", "")
+            value = ""
+            for part in cell:
+                if xml_tag(part) == "v":
+                    value = part.text or ""
+                elif xml_tag(part) == "is":
+                    value = "".join(t.text or "" for t in part.iter() if xml_tag(t) == "t")
+            if kind == "s" and value.isdigit() and int(value) < len(shared):
+                value = shared[int(value)]
+            elif kind == "b":
+                value = "TRUE" if value == "1" else "FALSE"
+            values.append(value)
+        yield values
+        if parent is not None:
+            parent.clear()   # rows already read are dropped
 
 
 def read_sqlite(source: Source, path: Path) -> None:
@@ -299,17 +326,32 @@ def read_sqlite(source: Source, path: Path) -> None:
 
 
 def read_sql_dump(source: Source, path: Path) -> None:
-    script = path.read_text(encoding="utf-8", errors="replace")
-    conn = sqlite3.connect(":memory:")
-    try:
-        conn.executescript(script)
-        read_connection(source, conn, "sql")
-    except sqlite3.Error as exc:
-        # Other SQL dialects still contain readable INSERT lines.
-        source.notes.append(f"not SQLite-compatible ({exc}); scanned as text lines")
-        read_text(source, script)
-    finally:
-        conn.close()
+    """Load the dump into a temporary SQLite file statement by statement, then read its tables."""
+    with tempfile.TemporaryDirectory(prefix="ghosttrace-sql-") as temp:
+        conn = sqlite3.connect(Path(temp) / "dump.db", isolation_level=None)
+        conn.execute("PRAGMA journal_mode=OFF")
+        conn.execute("PRAGMA synchronous=OFF")
+        try:
+            batch, statement = [], ""
+            with path.open(encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    statement += line
+                    if sqlite3.complete_statement(statement):
+                        batch.append(statement)
+                        statement = ""
+                        if len(batch) >= 2000:
+                            conn.executescript("".join(batch))
+                            batch = []
+            batch.append(statement)
+            conn.executescript("".join(batch))
+            read_connection(source, conn, "sql")
+        except sqlite3.Error as exc:
+            # Other SQL dialects still contain readable INSERT lines.
+            source.notes.append(f"not SQLite-compatible ({exc}); scanned as text lines")
+            with path.open(encoding="utf-8", errors="replace") as handle:
+                read_lines(source, handle)
+        finally:
+            conn.close()
 
 
 def read_connection(source: Source, conn: sqlite3.Connection, method: str) -> None:
@@ -334,8 +376,8 @@ def read_connection(source: Source, conn: sqlite3.Connection, method: str) -> No
                         pass
                 values[column] = text
             if values:
-                source.records.append(Record(source.name, f"table {table}, row {n}", table, values,
-                                             method=method, observed_at=record_time(values)))
+                source.add(Record(source.name, f"table {table}, row {n}", table, values,
+                                  method=method, observed_at=record_time(values)))
 
 
 # ---------------------------------------------------------------------------
@@ -364,8 +406,8 @@ def read_json(source: Source, obj: Any, place: str = "") -> None:
         elif isinstance(value, dict):
             fields = flat_fields(value)
             if fields:
-                source.records.append(Record(source.name, (place + " " + path).strip(), container, fields,
-                                             method="json", observed_at=record_time(fields)))
+                source.add(Record(source.name, (place + " " + path).strip(), container, fields,
+                                  method="json", observed_at=record_time(fields)))
             for key, child in value.items():
                 if isinstance(child, (dict, list)):
                     visit_children(child, f"{path}.{key}", child_name(container, key))
@@ -396,8 +438,8 @@ def read_xml(source: Source, path: Path) -> None:
         fields = {xml_tag(c): (c.text or "").strip() for c in children if len(c) == 0 and (c.text or "").strip()}
         fields.update({k: v for k, v in element.attrib.items()})
         if fields and any(len(c) == 0 for c in children):
-            source.records.append(Record(source.name, f"element {xml_tag(element)} #{n}", xml_tag(element),
-                                         fields, method="xml", observed_at=record_time(fields)))
+            source.add(Record(source.name, f"element {xml_tag(element)} #{n}", xml_tag(element),
+                              fields, method="xml", observed_at=record_time(fields)))
 
 
 # ---------------------------------------------------------------------------
@@ -409,16 +451,22 @@ def read_text(source: Source, text: str, html: bool = False, method: str = "text
         text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", text, flags=re.S | re.I)
         text = re.sub(r"<br\s*/?>|</p>|</tr>|</li>|</div>", "\n", text, flags=re.I)
         text = re.sub(r"<[^>]+>", " ", text)
-    for n, line in enumerate(text.splitlines(), 1):
-        if not line.strip():
+    read_lines(source, text.splitlines(), method, place, confidence, container)
+
+
+def read_lines(source: Source, lines: Any, method: str = "text", place: str = "", confidence: float = 1.0,
+               container: str = "") -> None:
+    """One record per non-empty line; log lines are parsed into fields."""
+    for n, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line:
             continue
         fields = {}
-        parsed = parse_line(line.strip()) if re.match(r"\d{4}-\d\d-\d\dT", line.strip()) else None
+        parsed = parse_line(line) if re.match(r"\d{4}-\d\d-\d\dT", line) else None
         if parsed:
             fields = {k: v for k, v in parsed.items() if v}
-        source.records.append(Record(source.name, f"{place}line {n}", container, fields, text=line.strip(),
-                                     method=method, observed_at=(parsed or {}).get("timestamp", ""),
-                                     confidence=confidence))
+        source.add(Record(source.name, f"{place}line {n}", container, fields, text=line,
+                          method=method, observed_at=(parsed or {}).get("timestamp", ""), confidence=confidence))
 
 
 def run_tool(command: list[str], timeout: int = 120) -> str:
@@ -448,17 +496,17 @@ def read_pdf(source: Source, path: Path) -> None:
             for n, page in enumerate(sorted(Path(temp).glob("page-*.png")), 1):
                 lines = ocr_lines(page)
                 for line, confidence in lines:
-                    source.records.append(Record(source.name, f"page {n} (OCR)", "", {}, text=line,
-                                                 method="pdf_ocr", confidence=confidence))
+                    source.add(Record(source.name, f"page {n} (OCR)", "", {}, text=line,
+                                      method="pdf_ocr", confidence=confidence))
                 fields, lowest = form_fields(lines)
                 if fields:
-                    source.records.append(Record(source.name, f"page {n} (OCR) form fields", "", fields,
-                                                 method="pdf_ocr", confidence=lowest))
+                    source.add(Record(source.name, f"page {n} (OCR) form fields", "", fields,
+                                      method="pdf_ocr", confidence=lowest))
     except FileNotFoundError:
         source.errors.append("scanned PDF needs pdftoppm and tesseract for OCR")
     except subprocess.SubprocessError as exc:
         source.errors.append(f"PDF OCR failed: {exc}")
-    if not source.records and not source.errors:
+    if not source.count and not source.errors:
         source.errors.append("no text could be read from this PDF")
 
 
@@ -505,11 +553,10 @@ def read_image(source: Source, path: Path) -> None:
         source.errors.append(f"OCR failed: {exc}")
         return
     for n, (line, confidence) in enumerate(lines, 1):
-        source.records.append(Record(source.name, f"OCR line {n}", "", {}, text=line, method="ocr",
-                                     confidence=confidence))
+        source.add(Record(source.name, f"OCR line {n}", "", {}, text=line, method="ocr", confidence=confidence))
     fields, lowest = form_fields(lines)
     if fields:
-        source.records.append(Record(source.name, "OCR form fields", "", fields, method="ocr", confidence=lowest))
+        source.add(Record(source.name, "OCR form fields", "", fields, method="ocr", confidence=lowest))
     if not lines:
         source.errors.append("OCR found no text in this image")
     else:
@@ -527,8 +574,7 @@ def read_docx(source: Source, path: Path) -> None:
             text = "".join(t.text or "" for t in element.iter() if xml_tag(t) == "t").strip()
             paragraph += 1
             if text:
-                source.records.append(Record(source.name, f"paragraph {paragraph}", "", {}, text=text,
-                                             method="docx"))
+                source.add(Record(source.name, f"paragraph {paragraph}", "", {}, text=text, method="docx"))
         elif xml_tag(element) == "tbl":
             grid = []
             for row in element.iter():
@@ -548,15 +594,14 @@ def read_pptx(source: Source, path: Path) -> None:
             for p, paragraph in enumerate((e for e in root.iter() if xml_tag(e) == "p"), 1):
                 text = "".join(t.text or "" for t in paragraph.iter() if xml_tag(t) == "t").strip()
                 if text:
-                    source.records.append(Record(source.name, f"slide {number}, paragraph {p}", "", {},
-                                                 text=text, method="pptx"))
+                    source.add(Record(source.name, f"slide {number}, paragraph {p}", "", {}, text=text, method="pptx"))
 
 
 def read_eml(source: Source, path: Path) -> None:
     message = BytesParser(policy=email_policy.default).parsebytes(path.read_bytes())
     headers = {k.lower(): str(v) for k, v in message.items() if k.lower() in
                ("from", "to", "cc", "bcc", "reply-to", "subject", "date")}
-    source.records.append(Record(source.name, "headers", "email", headers, method="eml"))
+    source.add(Record(source.name, "headers", "email", headers, method="eml"))
     body = message.get_body(preferencelist=("plain", "html"))
     if body is not None:
         read_text(source, body.get_content(), html=body.get_content_type() == "text/html", method="eml",
@@ -566,13 +611,28 @@ def read_eml(source: Source, path: Path) -> None:
 
 
 def read_zip(source: Source, path: Path) -> None:
+    """Each member is read with the same rules; its records are placed as 'member :: row 2'."""
     with zipfile.ZipFile(path) as archive, tempfile.TemporaryDirectory(prefix="ghosttrace-zip-") as temp:
         for info in archive.infolist():
-            if info.is_dir() or info.file_size > MAX_FILE_BYTES:
+            if info.is_dir():
                 continue
-            target = Path(temp) / Path(info.filename).name
-            target.write_bytes(archive.read(info))
-            member = read_source(target, name=f"{source.name}/{info.filename}")
-            source.records.extend(member.records)
+            target = Path(temp) / (Path(info.filename).name or "member")
+            with archive.open(info) as packed, target.open("wb") as unpacked:
+                shutil.copyfileobj(packed, unpacked)
+            member = Source(f"{source.name}/{info.filename}", kind_of(target), info.file_size, "")
+            member.sink = forward_to(source, info.filename)
+            try:
+                read_into(member, target)
+            except Exception as exc:
+                member.errors.append(f"could not read: {type(exc).__name__}: {exc}")
             source.errors.extend(f"{info.filename}: {e}" for e in member.errors)
             source.notes.extend(f"{info.filename}: {n}" for n in member.notes)
+            target.unlink()
+
+
+def forward_to(source: Source, member: str) -> Any:
+    def add(record: Record) -> None:
+        record.source = source.name
+        record.location = f"{member} :: {record.location}"
+        source.add(record)
+    return add

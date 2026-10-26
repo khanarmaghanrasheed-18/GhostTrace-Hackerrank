@@ -28,7 +28,7 @@ UI_DIR = Path(__file__).parent / "ui"
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"), "/index.html": ("index.html", "text/html; charset=utf-8"),
           "/app.js": ("app.js", "text/javascript; charset=utf-8"), "/graph.js": ("graph.js", "text/javascript; charset=utf-8"),
           "/style.css": ("style.css", "text/css; charset=utf-8")}
-MAX_BODY = 300 * 1024 * 1024
+MAX_BODY = 300 * 1024 * 1024           # requests read into memory (JSON, policy, request lists)
 
 
 class App:
@@ -237,8 +237,18 @@ def make_handler(app: App, port: int) -> type[BaseHTTPRequestHandler]:
                 if method == "GET" and path == "/api/sources":
                     return self.json(ws.source_list())
                 if method == "POST" and path == "/api/sources":
-                    name = ws.add_source(query.get("name", ["upload"])[0], self.body())
+                    # Written to disk as it arrives, so the file size is not limited by memory.
+                    length = int(self.headers.get("Content-Length") or 0)
+                    name = ws.add_upload(query.get("name", ["upload"])[0], self.rfile, length)
                     return self.json(next(s for s in ws.source_list() if s["name"] == name))
+                if method == "GET" and path == "/api/folders":
+                    return self.json({"folders": ws.folders()})
+                if method == "POST" and path == "/api/folders":
+                    folders = ws.link_folder(str(self.body_json().get("path", "")))
+                    ws.sources()   # read it into the index now
+                    return self.json({"folders": folders})
+                if method == "POST" and path == "/api/folders/remove":
+                    return self.json({"folders": ws.unlink_folder(str(self.body_json().get("path", "")))})
                 if method == "POST" and path == "/api/sources/settings":
                     data = self.body_json()
                     return self.json(ws.update_source(data["name"], data.get("changes", {})))
@@ -296,9 +306,12 @@ def make_handler(app: App, port: int) -> type[BaseHTTPRequestHandler]:
 def serve(workspace: Workspace, repo_root: Path, port: int = 8765, open_browser: bool = False) -> None:
     app = App(workspace, repo_root)
     count = sum(1 for p in workspace.sources_dir.iterdir() if p.is_file())
-    if count:
-        print(f"Reading {count} files in the workspace (screenshots and scans take a few seconds; results are cached)...")
-        workspace.sources()
+    folders = workspace.folders()
+    if count or folders:
+        print(f"Checking {count} uploaded files and {len(folders)} linked folders. New or changed files are read "
+              "into the local index once; large files take a while and show their progress here...")
+        sources = workspace.sources()
+        print(f"Ready: {len(sources)} files, {sum(s.count for s in sources):,} records.")
     httpd = ThreadingHTTPServer(("127.0.0.1", port), make_handler(app, port))
     url = f"http://127.0.0.1:{port}/"
     print(f"GhostTrace is running locally at {url}")
