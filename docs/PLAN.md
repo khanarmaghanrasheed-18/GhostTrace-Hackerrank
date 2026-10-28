@@ -43,9 +43,10 @@ The architecture comes from the "Agreed Architecture" section of [`GHOSTTRACE_PL
 | Benchmark engine (corrected) | Done. Public samples: status 32/32, exact rows 21/32, step precision 1.000, recall 0.938. 518-row output valid. |
 | Graph, timeline, what-if (benchmark) | Done |
 | General agent: readers, matching, links, policy, verdict, plan, graph, timeline, what-if, batch | Done |
-| Local web app: dashboard, sources, checks, graph explorer, timeline, plan, what-if, batch, policy, benchmark, settings | Done; driven end to end in headless Chromium with no script errors and no outside requests |
+| Local web app (rebuilt): home with guided start, sources with folder browser and live reading progress, check, results, batch with progress and history, policy editor, settings, benchmark; evidence drawer, graph explorer, timeline, plan checklist, what-if; command palette, light and dark themes, phone layout | Done; every page driven in headless Chromium with no script errors, no failed requests and no outside requests |
+| Background jobs, printable report, launchers, .mbox/.vcf/.ics readers | Done |
 | Demo data (`examples/`, fictional) | Done |
-| Tests | 73 passing: 22 benchmark-engine, 15 graph/timeline/what-if, 36 general agent, index and server |
+| Tests | 76 passing: 22 benchmark-engine, 15 graph/timeline/what-if, 39 general agent, index and server |
 | Large data | Measured on a fictional 5-million-row database; see the README's "Large data" section |
 | Gemini live use | Not exercised: no key in the build environment. The local rule reader is used and labelled. |
 | Hackathon evaluation/usage reports (`code/evaluation/*.md`) | Out of date (from `0318d88`); left untouched |

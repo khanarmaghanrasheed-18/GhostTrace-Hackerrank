@@ -3,26 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
   <title>GhostTrace</title>
   <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
 </head>
 <body>
-  <header class="top">
-    <a class="brand" href="#/dashboard"><span class="logo" aria-hidden="true"></span>GhostTrace</a>
-    <span class="tagline">Is the data really deleted? Runs entirely on this computer.</span>
-    <div id="privacy"></div>
-  </header>
-  <nav id="nav" aria-label="Main">
-    <a href="#/dashboard">Dashboard</a>
-    <a href="#/sources">Sources</a>
-    <a href="#/check">New check</a>
-    <a href="#/batch">Batch</a>
-    <a href="#/policy">Policy</a>
-    <a href="#/benchmark">Benchmark</a>
-    <a href="#/settings">Settings</a>
-  </nav>
-  <main id="view"></main>
-  <script src="/graph.js"></script>
-  <script src="/app.js"></script>
+  <noscript>GhostTrace needs JavaScript in this browser. Nothing leaves your computer: the app talks only to the program running on it.</noscript>
+  <div id="app"></div>
 </body>
 </html>

@@ -32,18 +32,23 @@ brew install poppler tesseract
 # Windows: install Tesseract (UB Mannheim build) and Poppler, and add both to PATH
 ```
 
-Start the app with the fictional demo company loaded:
+Start the app:
 
-```bash
-python3 code/main.py serve --add examples/acme_demo --manifest examples/acme_manifest.csv --open
-```
+| System | How |
+| --- | --- |
+| Windows | Double-click **`Start GhostTrace.bat`** |
+| macOS | Double-click **`start-ghosttrace.command`** (the first time: right-click it, then *Open*) |
+| Linux | Run `./start-ghosttrace.sh` |
+| Any | `python3 code/main.py serve --open` (on Windows `py` instead of `python3`) |
 
-(On Windows use `py` or `python` instead of `python3`.) Then:
+Your browser opens **http://127.0.0.1:8765/**. Leave the terminal window open while you use the app; closing it stops GhostTrace.
 
-1. Open **http://127.0.0.1:8765/**.
-2. Go to **New check** and enter `d.okafor@example.com`.
+To try it without your own data:
 
-The manifest only gives each demo file its capture time; it is optional.
+1. On **Home**, click **Try the demo company**.
+2. Check `d.okafor@example.com`.
+
+The demo is a fictional company with 12 files of every kind about one customer.
 
 Your files and results live in `./ghosttrace_workspace/`. Use `--workspace PATH` to keep them somewhere else, and `--port` to change the port.
 
@@ -81,14 +86,17 @@ A check takes the same few seconds no matter how many people you check in a batc
 
 | Page | What you do there |
 | --- | --- |
-| **Dashboard** | Totals for sources, unreadable files and checks by verdict, plus the kinds of data most often left behind. |
-| **Sources** | Drop in files of any supported type, or link a folder to read it in place. For each file you can set when it was captured, correct the guessed *kind of data*, group several files as copies of one *store*, and mark a file as a *complete snapshot*. |
-| **New check** | Enter emails, phones, names and IDs (any mix), and optionally "as of" a date. |
-| **Result** | Verdict, where the data still exists, every finding with its evidence, the graph, the timeline, the cleanup plan, what-if, identifiers, coverage, and the policy used. Download the findings as CSV or the whole result as JSON. |
-| **Batch** | Upload a CSV of requests (email / phone / name / user_id / request_text) and get one verdict per row as a table and a CSV. |
-| **Policy** | See the default deletion policy, or upload your own rules. |
+| **Home** | A guided start (add a folder, upload files, or try the demo), then an overview: a quick check box, recent checks, the kinds of data most often left behind, and files that could not be read. |
+| **Check a person** | Type emails, phones, IDs and names; each becomes a chip with its kind guessed (you can change it). Optionally check "as of" a date and add a ticket reference. |
+| **Result** | A plain-language verdict and what to do next, then tabs: a summary grouped by file, all findings (click one for its evidence: why it matched, the policy decision, the record with the matched values highlighted), the graph, the timeline, the cleanup plan as a checklist, what-if, identifiers (confirm or reject suggested links, then run again), and coverage. Export a printable report, the findings as CSV, or the full result as JSON. |
+| **Results** | Every saved check, filterable by verdict and searchable. |
+| **Batch check** | Drop a CSV of requests (a template is offered). A progress bar runs while each row is checked; every row then opens as its own full result. Earlier batches are kept. |
+| **Sources** | Add a folder to read in place (with a folder browser), upload files, or drop files anywhere on the page. Files are read in the background with live progress. Click a file to preview exactly what was read and to set its capture time, kind of data, store and complete-snapshot flag. |
+| **Deletion policy** | Edit the required action for each kind of data, import or export the rules as CSV, or go back to the default. |
+| **Settings** | Privacy details and the workspace folder, light or dark theme, the opt-in AI helper, and re-reading all files. |
 | **Benchmark** | Explore the bundled Northstar Shop dataset (550 synthetic deletion requests) with the same graph, timeline and what-if tools. |
-| **Settings** | Privacy details and the opt-in AI helper. |
+
+Press **Ctrl K** (⌘K on a Mac) anywhere to jump to a page, open a recent check, or check someone straight away.
 
 **The graph explorer** shows the person, every identifier, each record or copy, sync and restore processes, and the files they came from. You can:
 
@@ -135,7 +143,8 @@ The command line keeps its index in `./.cache/ghosttrace/index.sqlite`, so a sec
 | Spreadsheets | `.csv`, `.tsv` (delimiter detected), `.xlsx`, `.xlsm` (every sheet) |
 | Databases | SQLite files (`.db`, `.sqlite`, `.sqlite3`, or any file with an SQLite header) and SQL dumps (`.sql`). Dumps in other SQL dialects are scanned line by line. |
 | Structured data | `.json` (nested lists at any depth), `.jsonl` / `.ndjson`, `.xml` |
-| Documents | `.pdf` (text layer, or OCR for scans), `.docx`, `.pptx`, `.eml` (headers and body), `.txt`, `.md`, `.html`, `.log` (eight common log layouts, including JSON lines and syslog) |
+| Documents | `.pdf` (text layer, or OCR for scans), `.docx`, `.pptx`, `.eml` (headers and body), `.mbox` mailbox exports (every message), `.txt`, `.md`, `.html`, `.log` (eight common log layouts, including JSON lines and syslog) |
+| Contacts and calendars | `.vcf` (one record per contact) and `.ics` (one record per event, with organizer and attendees) |
 | Images | `.png`, `.jpg`, `.jpeg`, `.tif`, `.tiff`, `.bmp`, `.gif`, `.webp`, read by OCR with a confidence for each line |
 | Archives | `.zip`, whose members are read with the same rules |
 
@@ -205,12 +214,16 @@ code/ghosttrace/readers.py    readers for every supported file type
 code/ghosttrace/store.py      the on-disk index: each file read once, people looked up by identifier
 code/ghosttrace/classify.py   kind of data, state, identifier columns, policy loading
 code/ghosttrace/scanner.py    matching, identity links, findings, verdict, plan, graph, timeline, what-if, batch
-code/ghosttrace/workspace.py  the local workspace (files, settings, saved results, custom policy)
+code/ghosttrace/workspace.py  the local workspace (files, linked folders, settings, saved checks and batches, custom policy)
+code/ghosttrace/jobs.py       background jobs (reading files, batch checks) with progress
+code/ghosttrace/report.py     the printable HTML report of a check
 code/ghosttrace/server.py     local web server and JSON API
-code/ghosttrace/ui/           dashboard and graph explorer (plain HTML, CSS, JavaScript)
+code/ghosttrace/ui/           the app: plain HTML, CSS and JavaScript modules, no build step and nothing loaded from outside
+Start GhostTrace.bat, start-ghosttrace.command, start-ghosttrace.sh
+                              double-click launchers
 code/ghosttrace/ingest.py, identity.py, engine.py, graph.py, views.py, whatif.py
                               the benchmark audit engine for the Northstar dataset
-code/evaluation/              tests (73) and the benchmark evaluator
+code/evaluation/              tests (76) and the benchmark evaluator
 examples/                     fictional Acme Outdoor demo, its manifest and a batch request file
 docs/PLAN.md                  architecture decisions and status
 ```

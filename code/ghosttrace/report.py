@@ -47,6 +47,23 @@ td.wrap { word-break: break-word; }
 footer { margin-top: 32px; padding-top: 10px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
 @media print { main { padding: 0; } h2 { break-after: avoid; } tr { break-inside: avoid; } }
 """
+LABEL = {
+    "USER_PROFILE": "Customer profile", "SECONDARY_IDENTIFIER": "Identifier map", "SEARCH_INDEX_ENTRY": "Search index entry",
+    "CACHE_ENTRY": "Cache entry", "SUPPORT_MESSAGE": "Support conversation", "SUPPORT_ATTACHMENT": "Support attachment",
+    "ANALYTICS_PROFILE": "Analytics", "PRODUCT_TELEMETRY": "Product telemetry", "USER_EXPORT": "Data export",
+    "MARKETING_PROFILE": "Marketing list", "EMAIL_DELIVERY_LOG": "Email log", "SECURITY_AUDIT_LOG": "Security log",
+    "LEGAL_HOLD_RECORD": "Legal hold", "BACKUP_ARCHIVE": "Backup", "ACCOUNT_TOMBSTONE": "Deleted-account reference",
+    "FINANCIAL_RECORD": "Invoice / financial record", "PERSONAL_RECORD": "Other personal record",
+    "DATA_FLOW": "Sync / integration", "FORM_LOOKUP": "Search screen",
+}
+NEEDS = {"ABSENT": "delete it", "REDACTED": "redact it", "ANONYMIZED": "anonymize it", "PRESENT": "keep it",
+         "DISABLED": "turn it off", "BLOCKED": "block restoring"}
+
+
+def label(category: str) -> str:
+    return LABEL.get(category, category.replace("_", " ").lower())
+
+
 PILL = {"violation": "bad", "compliant": "good", "possible match": "warn", "unknown": "warn", "claim": "warn"}
 
 
@@ -74,7 +91,7 @@ def render(saved: dict[str, Any]) -> str:
     findings_rows = []
     for f in current:
         pill = f"<span class=\"pill {PILL.get(f['verdict'], '')}\">{escape(f['verdict'])}</span>"
-        findings_rows.append(f"<tr><td>{escape(f['id'])}</td><td>{pill}</td>{cell(f['category'])}"
+        findings_rows.append(f"<tr><td>{escape(f['id'])}</td><td>{pill}</td>{cell(label(f['category']))}"
                              f"{cell(f['source'] + ' / ' + f['location'])}{cell(f['state'] + ': ' + f['state_reason'])}"
                              f"{cell((f['rule_id'] + ' ' + f['policy']).strip())}"
                              f"{cell(', '.join(m['identifier'].split(':', 1)[-1] for m in f['matches']))}</tr>")
@@ -96,8 +113,8 @@ def render(saved: dict[str, Any]) -> str:
         f"<div class=\"counts\">{counts}</div>",
         "<h2>Where the data still exists</h2>",
         table(["ID", "Kind of data", "Where", "Policy needs", "Why"],
-              [[f["id"], f["category"], f"{f['source']} / {f['location']}", f"{f['policy']} → {f['required_state']}",
-                f["state_reason"]] for f in remaining]),
+              [[f["id"], label(f["category"]), f"{f['source']} / {f['location']}",
+                f"{f['rule_id']}: {NEEDS.get(f['required_state'], f['required_state'])}", f["state_reason"]] for f in remaining]),
         "<h2>Processes that can bring data back</h2>",
         table(["Process", "Kind", "State", "Where", "Can bring back", "Basis"],
               [[p["process"], p["kind"], p["state"], p["where"], ", ".join(p["can_recreate"]) or "—", p["basis"]]
@@ -117,7 +134,7 @@ def render(saved: dict[str, Any]) -> str:
               [[s["name"], s["kind"], f"{s['records']:,}", s["captured_at"]] for s in r["coverage"]["sources"]]),
         "<footer>GhostTrace checks only the files it was given, on this computer. A clean result means nothing "
         "was found in those files; it does not prove that no copy exists elsewhere. Policy rules used: "
-        + escape(", ".join(f"{p['rule_id']} {p['data_category']} {p['required_action']}" for p in r["policy"]))
+        + escape(", ".join(f"{p['rule_id']} {label(p['data_category'])}: {p['required_action'].lower()}" for p in r["policy"]))
         + ".</footer>",
     ]
     return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"

@@ -111,7 +111,9 @@ class App:
                 "records": sum(s["records"] for s in sources),
                 "unreadable": sum(1 for s in sources if not s["readable"]), "checks": len(checks),
                 "checks_by_status": by_status, "recent_checks": checks[:12], "batches": len(ws.list_batches()),
-                "reading": self.reading(), "ready": ws.ready() and not ws.busy(),
+                "reading": self.reading(),
+                "ready": ws.ready() and not ws.busy() and not self.jobs.running("index")
+                and not any(s["status"] == "waiting" for s in sources),
                 "ai": {"key_configured": self.gemini.ready, "allowed": bool(ws.settings().get("ai_allowed")),
                        "usage": self.gemini.usage()},
                 "supported": sorted(SUPPORTED), "categories": CATEGORIES,
