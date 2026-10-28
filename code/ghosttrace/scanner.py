@@ -315,9 +315,10 @@ def source_meta(meta: dict[str, dict[str, Any]], name: str) -> dict[str, Any]:
 
 def load_sources(paths: list[Path], cache_dir: Path | None, meta: dict[str, dict[str, Any]] | None = None,
                  base: Path | None = None, store: Store | None = None, prefix: str = "",
-                 progress: Any = None) -> list[Source]:
+                 progress: Any = None, done: Any = None) -> list[Source]:
     """Sources for every file, read into the index at cache_dir/index.sqlite (in memory without a cache_dir).
-    Names are relative to base when given, and start with prefix."""
+    Names are relative to base when given, and start with prefix. progress(name, records, seconds)
+    reports files being read; done(source) is called as each file is ready."""
     if store is None:
         store = Store(cache_dir / "index.sqlite" if cache_dir else None)
     sources = []
@@ -328,6 +329,8 @@ def load_sources(paths: list[Path], cache_dir: Path | None, meta: dict[str, dict
         source.notes.insert(0, "capture time stated" if stated else
                             "capture time unknown; using the file's modified time")
         sources.append(source)
+        if done:
+            done(source)
     return sources
 
 
@@ -1040,9 +1043,14 @@ REQUEST_COLUMNS = {"email": ("email", "emails", "e-mail", "email_address"), "pho
 
 
 def batch(sources: list[Source], rows: list[dict[str, str]], policy_file: Path | None = None,
-          meta: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+          meta: dict[str, dict[str, Any]] | None = None, progress: Any = None,
+          keep_results: bool = False) -> list[dict[str, Any]]:
+    """One verdict per request row. progress(rows done, rows in total) is called before each row.
+    With keep_results, each checked row also carries its full result under "result"."""
     out = []
     for n, row in enumerate(rows, 1):
+        if progress:
+            progress(n - 1, len(rows))
         lowered = {k.strip().lower(): (v or "").strip() for k, v in row.items() if k}
         pick = {key: next((lowered[c] for c in names if lowered.get(c)), "") for key, names in REQUEST_COLUMNS.items()}
         label = pick["label"] or f"row {n}"
@@ -1068,10 +1076,17 @@ def batch(sources: list[Source], rows: list[dict[str, str]], policy_file: Path |
                         "status_text": "the request does not clearly ask for deletion; what was found is listed for review",
                         "still_exists": result["counts"]["still_exists"], "needs_review": result["counts"]["needs_review"],
                         "where": where})
-            continue
-        out.append({"request": label, "status": result["status"], "status_text": result["status_text"],
-                    "still_exists": result["counts"]["still_exists"], "needs_review": result["counts"]["needs_review"],
-                    "where": where})
+        else:
+            out.append({"request": label, "status": result["status"], "status_text": result["status_text"],
+                        "still_exists": result["counts"]["still_exists"],
+                        "needs_review": result["counts"]["needs_review"], "where": where})
+        if keep_results:
+            out[-1]["result"] = result
+            out[-1]["subject"] = {"emails": split(pick["email"]), "phones": split(pick["phone"]),
+                                  "names": split(pick["name"]), "ids": split(pick["id"]), "as_of": pick["as_of"],
+                                  "label": pick["label"]}
+    if progress:
+        progress(len(rows), len(rows))
     return out
 
 

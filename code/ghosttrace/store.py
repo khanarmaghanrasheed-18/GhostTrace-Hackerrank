@@ -334,6 +334,14 @@ class Store:
                         ids.add(record_id)
             return self.records(ids, files)
 
+    def sample(self, digest: str, limit: int = 50, offset: int = 0) -> list[Record]:
+        """Records of one file in file order, for a preview."""
+        with self.lock:
+            files = self.file_ids({digest})
+            return [to_record(row) for row in self.db.execute(
+                f"SELECT {COLUMNS} FROM records WHERE file = ? ORDER BY id LIMIT ? OFFSET ?",
+                (next(iter(files), -1), limit, offset))]
+
     def page(self, digest: str, page: str) -> list[Record]:
         """Every record on one page of a document, in reading order."""
         with self.lock:

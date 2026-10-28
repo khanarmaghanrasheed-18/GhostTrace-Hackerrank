@@ -24,13 +24,17 @@ import json
 from pathlib import Path
 import sys
 
-from ghosttrace import scanner, whatif
-from ghosttrace.engine import AuditEngine
-from ghosttrace.gemini import GeminiInterpreter
-from ghosttrace.ingest import read_csv
-from ghosttrace.validate import validate_file
-from ghosttrace.views import case_graph, case_timeline, render_graph, render_timeline
-from ghosttrace.workspace import show_progress
+if sys.version_info < (3, 10):
+    sys.exit("GhostTrace needs Python 3.10 or newer; this is Python "
+             f"{sys.version_info[0]}.{sys.version_info[1]}. Download a newer one from https://www.python.org/downloads/")
+
+from ghosttrace import scanner, whatif  # noqa: E402
+from ghosttrace.engine import AuditEngine  # noqa: E402
+from ghosttrace.gemini import GeminiInterpreter  # noqa: E402
+from ghosttrace.ingest import read_csv  # noqa: E402
+from ghosttrace.validate import validate_file  # noqa: E402
+from ghosttrace.views import case_graph, case_timeline, render_graph, render_timeline  # noqa: E402
+from ghosttrace.workspace import show_progress  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]

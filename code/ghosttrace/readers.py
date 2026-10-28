@@ -4,7 +4,8 @@ Supported without extra Python packages:
   spreadsheets  .csv .tsv .xlsx .xlsm
   databases     SQLite files (.db .sqlite .sqlite3) and SQL dumps (.sql)
   structured    .json .jsonl .ndjson .xml
-  documents     .pdf (text layer, OCR fallback) .docx .pptx .eml .txt .md .html .log
+  documents     .pdf (text layer, OCR fallback) .docx .pptx .eml .mbox .txt .md .html .log
+  contacts      .vcf (vCard) and calendars .ics (iCalendar)
   images        .png .jpg .jpeg .tif .tiff .bmp .gif .webp (OCR)
   archives      .zip (members are read with the same rules)
 PDF and image text needs the command-line tools pdftotext/pdftoppm (poppler-utils)
@@ -24,6 +25,7 @@ from email import policy as email_policy
 from email.parser import BytesParser
 import io
 import json
+import mailbox
 import os
 from pathlib import Path
 import re
@@ -42,8 +44,8 @@ csv.field_size_limit(2 ** 31 - 1)    # very long cells (notes, JSON blobs) are s
 
 SPREADSHEET = {".csv", ".tsv", ".xlsx", ".xlsm"}
 DATABASE = {".db", ".sqlite", ".sqlite3", ".sql"}
-STRUCTURED = {".json", ".jsonl", ".ndjson", ".xml"}
-DOCUMENT = {".pdf", ".docx", ".pptx", ".eml", ".txt", ".md", ".html", ".htm", ".log", ".text"}
+STRUCTURED = {".json", ".jsonl", ".ndjson", ".xml", ".vcf", ".ics"}
+DOCUMENT = {".pdf", ".docx", ".pptx", ".eml", ".mbox", ".txt", ".md", ".html", ".htm", ".log", ".text"}
 IMAGE = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
 ARCHIVE = {".zip"}
 SUPPORTED = SPREADSHEET | DATABASE | STRUCTURED | DOCUMENT | IMAGE | ARCHIVE
@@ -190,6 +192,12 @@ def read_into(source: Source, path: Path) -> None:
         read_pptx(source, path)
     elif suffix == ".eml":
         read_eml(source, path)
+    elif suffix == ".mbox":
+        read_mbox(source, path)
+    elif suffix == ".vcf":
+        read_cards(source, path, "VCARD", "contact", "contacts")
+    elif suffix == ".ics":
+        read_cards(source, path, "VEVENT", "event", "calendar")
     elif source.kind == "image":
         read_image(source, path)
     elif suffix == ".zip":
@@ -598,16 +606,97 @@ def read_pptx(source: Source, path: Path) -> None:
 
 
 def read_eml(source: Source, path: Path) -> None:
-    message = BytesParser(policy=email_policy.default).parsebytes(path.read_bytes())
+    read_message(source, BytesParser(policy=email_policy.default).parsebytes(path.read_bytes()), "")
+
+
+def read_message(source: Source, message: Any, place: str) -> None:
+    """The headers of one email as a record, then its body line by line."""
     headers = {k.lower(): str(v) for k, v in message.items() if k.lower() in
                ("from", "to", "cc", "bcc", "reply-to", "subject", "date")}
-    source.add(Record(source.name, "headers", "email", headers, method="eml"))
+    when = ""
+    try:
+        when = iso_time(email_date(headers.get("date", "")))
+    except (TypeError, ValueError):
+        pass
+    source.add(Record(source.name, f"{place}headers", "email", headers, method="eml", observed_at=when))
     body = message.get_body(preferencelist=("plain", "html"))
     if body is not None:
-        read_text(source, body.get_content(), html=body.get_content_type() == "text/html", method="eml",
-                  place="body ")
+        try:
+            content = body.get_content()
+        except (LookupError, ValueError):   # an unknown character set
+            content = body.get_payload(decode=True).decode("utf-8", errors="replace")
+        read_text(source, content, html=body.get_content_type() == "text/html", method="eml", place=f"{place}body ")
     for part in message.iter_attachments():
-        source.notes.append(f"attachment {part.get_filename()} not opened; save and add it separately")
+        source.notes.append(f"{place}attachment {part.get_filename()} not opened; save and add it separately")
+
+
+def email_date(value: str) -> str:
+    from email.utils import parsedate_to_datetime
+    return parsedate_to_datetime(value).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") if value else ""
+
+
+def read_mbox(source: Source, path: Path) -> None:
+    """A mailbox export (Thunderbird, Gmail Takeout, Apple Mail): every message, one by one."""
+    box = mailbox.mbox(path, factory=None, create=False)
+    try:
+        for n, key in enumerate(box.iterkeys(), 1):
+            raw = box.get_bytes(key)
+            read_message(source, BytesParser(policy=email_policy.default).parsebytes(raw), f"message {n}, ")
+    finally:
+        box.close()
+
+
+def unfolded_lines(path: Path) -> Any:
+    """Lines of a vCard or iCalendar file, with folded continuation lines joined."""
+    current = ""
+    with path.open(encoding="utf-8-sig", errors="replace") as handle:
+        for line in handle:
+            line = line.rstrip("\r\n")
+            if line[:1] in (" ", "\t"):
+                current += line[1:]
+                continue
+            if current:
+                yield current
+            current = line
+    if current:
+        yield current
+
+
+CARD_FIELDS = {"FN": "full_name", "N": "name_parts", "EMAIL": "email", "TEL": "phone", "ORG": "company",
+               "TITLE": "job_title", "ADR": "address", "BDAY": "birth_date", "UID": "uid", "NOTE": "note",
+               "SUMMARY": "summary", "DESCRIPTION": "description", "LOCATION": "location", "ORGANIZER": "organizer_email",
+               "ATTENDEE": "attendee_email", "DTSTART": "start", "DTEND": "end", "URL": "url"}
+
+
+def read_cards(source: Source, path: Path, block: str, noun: str, container: str) -> None:
+    """vCard contacts or iCalendar events: one record per BEGIN/END block."""
+    fields: dict[str, str] | None = None
+    n = 0
+    for line in unfolded_lines(path):
+        name, _, value = line.partition(":")
+        key = name.split(";")[0].upper()
+        if key == "BEGIN" and value.strip().upper() == block:
+            fields = {}
+            continue
+        if key == "END" and value.strip().upper() == block and fields is not None:
+            n += 1
+            if fields:
+                start = fields.get("start", "")
+                if re.match(r"\d{8}T\d{6}", start):     # 20260301T093000Z
+                    start = f"{start[:4]}-{start[4:6]}-{start[6:8]}T{start[9:11]}:{start[11:13]}:{start[13:15]}"
+                elif re.match(r"\d{8}$", start):        # an all-day event: 20260301
+                    start = f"{start[:4]}-{start[4:6]}-{start[6:8]}"
+                when = iso_time(start)
+                source.add(Record(source.name, f"{noun} {n}", container, fields, method=noun, observed_at=when))
+            fields = None
+            continue
+        if fields is None or key not in CARD_FIELDS or not value.strip():
+            continue
+        value = re.sub(r"^mailto:", "", value.strip(), flags=re.I).replace("\\,", ",").replace("\\n", " ")
+        column, k = CARD_FIELDS[key], 2
+        while column in fields:   # a second email or phone: email_2, phone_2 ...
+            column, k = f"{CARD_FIELDS[key]}_{k}", k + 1
+        fields[column] = value.replace(";", " ").strip() if key in ("N", "ADR") else value
 
 
 def read_zip(source: Source, path: Path) -> None:

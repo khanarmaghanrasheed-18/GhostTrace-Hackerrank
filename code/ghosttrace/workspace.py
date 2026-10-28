@@ -5,6 +5,7 @@ Layout:
   <workspace>/folders.json    folders read in place, never copied (for large data)
   <workspace>/sources.json    per-file settings: captured_at, category, store, complete
   <workspace>/checks/         saved check results (JSON)
+  <workspace>/batches/        saved batch results (JSON)
   <workspace>/policy.csv      optional custom deletion policy
   <workspace>/settings.json   local settings, e.g. whether the AI helper is allowed
   <workspace>/.cache/         the index of every record (index.sqlite)
@@ -26,7 +27,7 @@ from typing import Any, BinaryIO
 
 from .classify import CATEGORIES, load_policy
 from .readers import Source, iso_time
-from .scanner import load_sources, read_manifest
+from .scanner import collect_files, load_sources, read_manifest
 from .store import Store
 
 
@@ -50,12 +51,27 @@ class Workspace:
         self.root = root.resolve()
         self.sources_dir = self.root / "sources"
         self.checks_dir = self.root / "checks"
+        self.batches_dir = self.root / "batches"
         self.cache_dir = self.root / ".cache"
-        for folder in (self.sources_dir, self.checks_dir, self.cache_dir):
+        for folder in (self.sources_dir, self.checks_dir, self.batches_dir, self.cache_dir):
             folder.mkdir(parents=True, exist_ok=True)
         self.store = Store(self.cache_dir / "index.sqlite")
         self._sources: list[Source] | None = None
-        self._lock = threading.Lock()   # one reader at a time; OCR is slow and the index keeps what was read
+        self._listed: list[Source] = []     # the last complete list, shown while files are being read
+        self._generation = 0                # bumped whenever the files or their settings change
+        self._lock = threading.Lock()       # one reader at a time; OCR is slow and the index keeps what was read
+
+    def invalidate(self) -> None:
+        """The files or their settings changed: the next sources() reads what is new."""
+        self._generation += 1
+        self._sources = None
+
+    def busy(self) -> bool:
+        """Whether files are being read into the index right now."""
+        return self._lock.locked()
+
+    def ready(self) -> bool:
+        return self._sources is not None
 
     # -- files ---------------------------------------------------------------
 
@@ -65,7 +81,7 @@ class Workspace:
 
     def save_meta(self, meta: dict[str, dict[str, Any]]) -> None:
         (self.root / "sources.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-        self._sources = None
+        self.invalidate()
 
     def new_target(self, name: str) -> Path:
         target = self.sources_dir / safe_name(name)
@@ -78,7 +94,7 @@ class Workspace:
     def add_source(self, name: str, data: bytes) -> str:
         target = self.new_target(name)
         target.write_bytes(data)
-        self._sources = None
+        self.invalidate()
         return target.name
 
     def add_upload(self, name: str, stream: BinaryIO, length: int) -> str:
@@ -95,13 +111,13 @@ class Workspace:
         if left > 0:
             target.unlink()
             raise ValueError("the upload was interrupted")
-        self._sources = None
+        self.invalidate()
         return target.name
 
     def copy_source(self, path: Path) -> str:
         target = self.new_target(path.name)
         shutil.copyfile(path, target)
-        self._sources = None
+        self.invalidate()
         return target.name
 
     def remove_source(self, name: str) -> bool:
@@ -136,18 +152,18 @@ class Workspace:
         if str(path) not in folders:
             folders.append(str(path))
             (self.root / "folders.json").write_text(json.dumps(folders, indent=2), encoding="utf-8")
-            self._sources = None
+            self.invalidate()
         return folders
 
     def unlink_folder(self, folder: str) -> list[str]:
         folders = [f for f in self.folders() if f != folder]
         (self.root / "folders.json").write_text(json.dumps(folders, indent=2), encoding="utf-8")
-        self._sources = None
+        self.invalidate()
         self.store.prune({s.digest for s in self.sources()})
         return folders
 
     def update_source(self, name: str, changes: dict[str, Any]) -> dict[str, Any]:
-        if name not in {s.name for s in self.sources()}:
+        if name not in self.file_names():
             raise ValueError("unknown source")
         meta = self.meta()
         entry = meta.get(name, {})
@@ -172,41 +188,84 @@ class Workspace:
         path.unlink()
         meta = self.meta()
         count = 0
-        for source in self.sources():
-            entry = found.get(Path(source.name).name)
+        for name in self.file_names():
+            entry = found.get(Path(name).name)
             if entry:
-                meta.setdefault(source.name, {}).update({k: v for k, v in entry.items() if v})
+                meta.setdefault(name, {}).update({k: v for k, v in entry.items() if v})
                 count += 1
         self.save_meta(meta)
         return count
 
-    def sources(self) -> list[Source]:
-        """Uploaded files, then the files of each linked folder (named 'folder/relative path')."""
+    def roots(self) -> list[tuple[Path, Path, str]]:
+        """(path, base, name prefix) for the uploads folder and each linked folder that exists.
+        Files are named relative to base, after the prefix ('folder/relative path')."""
+        out = [(self.sources_dir, self.sources_dir, "")]
+        used = set()
+        for folder in self.folders():
+            path = Path(folder)
+            if not path.exists():
+                continue
+            base = path if path.is_dir() else path.parent
+            prefix, n = base.name or "folder", 2
+            while prefix in used:   # two linked folders with the same name
+                prefix, n = f"{base.name} ({n})", n + 1
+            used.add(prefix)
+            out.append((path, base, prefix + "/"))
+        return out
+
+    def file_names(self) -> list[str]:
+        """The names every file will have, without reading any of them."""
+        return [prefix + found.relative_to(base).as_posix()
+                for path, base, prefix in self.roots() for found in collect_files([path])]
+
+    def sources(self, progress: Any = None, done: Any = None) -> list[Source]:
+        """Uploaded files, then the files of each linked folder (named 'folder/relative path').
+
+        progress(name, records, seconds=None) reports a file being read; done(source) is
+        called as each file is ready. Both are optional; progress is also shown in the terminal."""
+
+        def report(name: str, count: int, seconds: float | None = None) -> None:
+            show_progress(name, count, seconds)
+            if progress:
+                progress(name, count, seconds)
+
         with self._lock:
             if self._sources is None:
+                generation = self._generation
                 meta = self.meta()
-                found = load_sources([self.sources_dir], None, meta, base=self.sources_dir, store=self.store,
-                                     progress=show_progress)
-                used = set()
-                for folder in self.folders():
-                    path = Path(folder)
-                    if not path.exists():
-                        continue
-                    base = path if path.is_dir() else path.parent
-                    prefix, n = base.name or "folder", 2
-                    while prefix in used:   # two linked folders with the same name
-                        prefix, n = f"{base.name} ({n})", n + 1
-                    used.add(prefix)
-                    found += load_sources([path], None, meta, base=base, store=self.store,
-                                          prefix=prefix + "/", progress=show_progress)
-                self._sources = found
+                found = []
+                for path, base, prefix in self.roots():
+                    found += load_sources([path], None, meta, base=base, store=self.store, prefix=prefix,
+                                          progress=report, done=done)
+                self._listed = found
+                if generation == self._generation:   # nothing changed while reading
+                    self._sources = found
+                return found
             return self._sources
 
-    def source_list(self) -> list[dict[str, Any]]:
+    def file_count(self) -> int:
+        """How many files a full read covers (uploaded files and linked folders)."""
+        return len(self.file_names())
+
+    def source_list(self, wait: bool = True) -> list[dict[str, Any]]:
+        """Every file with its settings. With wait=False this never blocks: while files are
+        being read it shows the last complete list, and new uploads as 'waiting'."""
         meta = self.meta()
+        if wait or (self._sources is not None and not self.busy()):
+            sources, current = self.sources(), True
+        else:
+            sources, current = (self._sources or self._listed), False
         out = []
-        for source in self.sources():
-            out.append({**source.summary(), "settings": meta.get(source.name, {}), "linked": "/" in source.name})
+        for source in sources:
+            out.append({**source.summary(), "settings": meta.get(source.name, {}), "linked": "/" in source.name,
+                        "status": "ready"})
+        if not current:
+            known = {s["name"] for s in out}
+            for path in collect_files([self.sources_dir]):
+                if path.name not in known:
+                    out.append({"name": path.name, "kind": "", "size": path.stat().st_size, "captured_at": "",
+                                "records": 0, "containers": [], "errors": [], "notes": [], "readable": True,
+                                "settings": meta.get(path.name, {}), "linked": False, "status": "waiting"})
         return out
 
     # -- checks --------------------------------------------------------------
@@ -238,6 +297,43 @@ class Workspace:
                         "categories": sorted({f["category"] for f in result["findings"] if f["verdict"] == "violation"})})
         return out
 
+    # -- batches -------------------------------------------------------------
+
+    def save_batch(self, name: str, rows: int, results: list[dict[str, Any]]) -> str:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        batch_id, n = f"batch-{stamp}", 2
+        while (self.batches_dir / f"{batch_id}.json").exists():
+            batch_id = f"batch-{stamp}-{n}"
+            n += 1
+        saved = {"id": batch_id, "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                 "file": name, "rows": rows, "results": results}
+        (self.batches_dir / f"{batch_id}.json").write_text(json.dumps(saved, ensure_ascii=False), encoding="utf-8")
+        return batch_id
+
+    def get_batch(self, batch_id: str) -> dict[str, Any] | None:
+        if not re.fullmatch(r"batch-[\w-]+", batch_id):
+            return None
+        path = self.batches_dir / f"{batch_id}.json"
+        return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+
+    def list_batches(self) -> list[dict[str, Any]]:
+        out = []
+        for path in sorted(self.batches_dir.glob("batch-*.json"), reverse=True):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            counts: dict[str, int] = {}
+            for row in data["results"]:
+                counts[row["status"]] = counts.get(row["status"], 0) + 1
+            out.append({"id": data["id"], "created_at": data["created_at"], "file": data["file"],
+                        "rows": data["rows"], "by_status": counts})
+        return out
+
+    def delete_batch(self, batch_id: str) -> bool:
+        path = self.batches_dir / f"{batch_id}.json"
+        if re.fullmatch(r"batch-[\w-]+", batch_id) and path.is_file():
+            path.unlink()
+            return True
+        return False
+
     def delete_check(self, check_id: str) -> bool:
         path = self.checks_dir / f"{check_id}.json"
         if re.fullmatch(r"check-[\w-]+", check_id) and path.is_file():
@@ -263,6 +359,29 @@ class Workspace:
             raise ValueError(f"unknown required_action values: {', '.join(sorted(set(bad)))}")
         (self.root / "policy.csv").write_text(text, encoding="utf-8")
         return self.policy()
+
+    def set_rules(self, rules: list[dict[str, str]]) -> list[dict[str, str]]:
+        """Save rules edited on the page; only rules that differ from the default are kept."""
+        default = {r["data_category"]: r for r in load_policy(None).values()}
+        out = io.StringIO()
+        writer = csv.writer(out)
+        writer.writerow(["rule_id", "data_category", "condition", "required_action"])
+        changed = 0
+        for rule in rules:
+            category = str(rule.get("data_category", "")).strip().upper()
+            action = str(rule.get("required_action", "")).strip().upper()
+            if category not in CATEGORIES:
+                raise ValueError(f"unknown kind of data: {category or '(empty)'}")
+            base = default.get(category, {})
+            if action == base.get("required_action") and str(rule.get("condition", "")) == base.get("condition", ""):
+                continue
+            writer.writerow([str(rule.get("rule_id") or base.get("rule_id") or f"C-{category}"), category,
+                             str(rule.get("condition", "")), action])
+            changed += 1
+        if not changed:
+            self.reset_policy()
+            return self.policy()
+        return self.set_policy(out.getvalue().encode("utf-8"))
 
     def reset_policy(self) -> None:
         path = self.root / "policy.csv"

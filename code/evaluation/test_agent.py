@@ -81,6 +81,26 @@ class ReaderTests(unittest.TestCase):
             self.assertIn("x@example.com", texts, path.name)
         self.assertNotIn("var a", json.dumps([r.text for r in read_source(self.dir / "e.html").records]))
 
+    def test_mailboxes_contacts_and_calendars(self) -> None:
+        box = self.write("export.mbox", "From a@x Mon Mar  2 10:00:00 2026\nFrom: Jane <jane@example.com>\n"
+                         "To: shop@example.org\nSubject: Order\nDate: Mon, 02 Mar 2026 10:00:00 +0000\n\nHello there\n\n"
+                         "From b@x Tue Mar  3 10:00:00 2026\nFrom: shop@example.org\nTo: jane@example.com\n"
+                         "Subject: Re: Order\n\nCall me on +44 7700 900555\n")
+        records = read_source(box).records
+        self.assertEqual([r.location for r in records if r.location.endswith("headers")],
+                         ["message 1, headers", "message 2, headers"])
+        self.assertEqual(records[0].observed_at, "2026-03-02T10:00:00Z")
+        cards = read_source(self.write("contacts.vcf", "BEGIN:VCARD\nVERSION:3.0\nFN:Jane Doe\n"
+                                       "EMAIL;TYPE=work:jane@exa\n mple.com\nEMAIL:j.doe@example.net\nTEL:+44 7700 900555\n"
+                                       "END:VCARD\n")).records
+        self.assertEqual(cards[0].fields["email"], "jane@example.com")      # a folded line is joined
+        self.assertEqual(cards[0].fields["email_2"], "j.doe@example.net")
+        events = read_source(self.write("calendar.ics", "BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:Delivery call\n"
+                                        "DTSTART:20260301T093000Z\nATTENDEE;CN=Jane:mailto:jane@example.com\n"
+                                        "END:VEVENT\nEND:VCALENDAR\n")).records
+        self.assertEqual((events[0].fields["attendee_email"], events[0].observed_at),
+                         ("jane@example.com", "2026-03-01T09:30:00Z"))
+
     def test_nested_json_lists_at_any_depth_are_read(self) -> None:
         path = self.write("n.json", json.dumps({"exports": {"crm": {"rows": [{"email": "x@example.com"}]}}}))
         records = read_source(path).records
@@ -469,14 +489,33 @@ class ServerTests(unittest.TestCase):
         cls.httpd.server_close()
         shutil.rmtree(cls.dir)
 
-    def call(self, method: str, path: str, body: bytes | None = None, host: str | None = None) -> tuple[int, dict, bytes]:
+    def call(self, method: str, path: str, body: bytes | None = None, host: str | None = None,
+             origin: str | None = None) -> tuple[int, dict, bytes]:
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=60)
         headers = {"Host": host or f"127.0.0.1:{self.port}"}
+        if origin:
+            headers["Origin"] = origin
         conn.request(method, path, body=body, headers=headers)
         response = conn.getresponse()
         data = response.read()
         conn.close()
         return response.status, dict(response.getheaders()), data
+
+    def post(self, path: str, data: dict) -> dict:
+        status, _, body = self.call("POST", path, json.dumps(data).encode())
+        self.assertEqual(status, 200, body)
+        return json.loads(body)
+
+    def wait(self, job: dict) -> dict:
+        """Poll a background job until it finishes, as the page does."""
+        import time
+        for _ in range(600):
+            state = json.loads(self.call("GET", f"/api/jobs/{job['id']}")[2])
+            if state["status"] != "running":
+                self.assertEqual(state["status"], "done", state["error"])
+                return state
+            time.sleep(0.05)
+        self.fail("job did not finish")
 
     def test_page_is_local_and_locked_down(self) -> None:
         status, headers, body = self.call("GET", "/")
@@ -484,9 +523,13 @@ class ServerTests(unittest.TestCase):
         self.assertIn("default-src 'self'", headers["Content-Security-Policy"])
         self.assertNotIn(b"http://", body.replace(b"http://www.w3.org", b""))
         self.assertEqual(self.call("GET", "/api/status", host="attacker.example")[0], 403)
+        refused = self.call("POST", "/api/settings", b"{}", origin="https://attacker.example")
+        self.assertEqual(refused[0], 403)                                   # no requests from other sites
+        self.assertEqual(self.call("GET", "/app.js")[0], 200)
+        self.assertEqual(self.call("GET", "/../server.py")[0], 404)
 
     def test_upload_check_whatif_and_export(self) -> None:
-        status, _, data = self.call("POST", "/api/sources?name=../../etc/people.csv",
+        status, _, data = self.call("POST", "/api/sources?name=../../etc/people.csv&wait=1",
                                     b"email,phone\nx@example.com,+44 7700 900321\n")
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(data)["name"], "people.csv")          # no path traversal
@@ -500,6 +543,42 @@ class ServerTests(unittest.TestCase):
         status, headers, data = self.call("GET", f"/api/checks/{check['id']}/export.csv")
         self.assertIn("people.csv", data.decode())
         self.assertEqual(self.call("GET", "/api/checks/..%2F..%2Fsecret")[0], 404)
+        status, headers, data = self.call("GET", f"/api/checks/{check['id']}/report.html")
+        self.assertIn("x@example.com", data.decode())
+        self.assertIn("default-src 'none'", headers["Content-Security-Policy"])   # the report runs no scripts
+        preview = json.loads(self.call("GET", "/api/sources/preview?name=people.csv")[2])
+        self.assertEqual(preview["records"][0]["fields"]["email"], "x@example.com")
+
+    def test_uploads_and_batches_run_in_the_background(self) -> None:
+        status, _, data = self.call("POST", "/api/sources?name=crm_people.csv", b"email,name\nb1@example.com,B\n")
+        upload = json.loads(data)
+        self.wait(upload["job"])
+        names = {s["name"]: s for s in json.loads(self.call("GET", "/api/sources")[2])}
+        self.assertEqual(names["crm_people.csv"]["status"], "ready")
+        status, _, data = self.call("POST", "/api/batch?name=requests.csv",
+                                    b"request_id,email,request_text\nR1,b1@example.com,Please delete my data\n"
+                                    b"R2,b1@example.com,\"Please do not delete my account, just update my email\"\n")
+        job = self.wait(json.loads(data)["job"])
+        batch = json.loads(self.call("GET", f"/api/batches/{job['result']['batch_id']}")[2])
+        self.assertEqual([r["status"] for r in batch["results"]], ["STILL_EXISTS", "NOT_APPLICABLE"])
+        opened = json.loads(self.call("GET", f"/api/checks/{batch['results'][0]['check_id']}")[2])
+        self.assertEqual(opened["request"]["batch"], "requests.csv")       # each row's full result can be opened
+        self.assertIn("R1", self.call("GET", f"/api/batches/{batch['id']}/export.csv")[2].decode())
+
+    def test_browse_policy_rules_and_demo(self) -> None:
+        listing = json.loads(self.call("GET", f"/api/browse?path={ROOT / 'examples'}")[2])
+        self.assertIn("acme_demo", [e["name"] for e in listing["entries"] if e["dir"]])
+        self.assertEqual(self.call("GET", "/api/browse?path=/no/such/folder")[0], 400)
+        rules = self.post("/api/policy/rules", {"rules": [{"data_category": "SECURITY_AUDIT_LOG",
+                                                            "condition": "Always", "required_action": "DELETE"}]})
+        self.assertTrue(rules["custom"])
+        self.assertEqual({r["data_category"]: r["required_action"] for r in rules["rules"]}["SECURITY_AUDIT_LOG"], "DELETE")
+        self.post("/api/policy/reset", {})
+        job = self.post("/api/demo", {})["job"]
+        self.wait(job)
+        status = json.loads(self.call("GET", "/api/status")[2])
+        self.assertGreaterEqual(status["sources"], 12)
+        self.assertTrue(status["ready"])
 
     def test_linked_folder_is_read_in_place_and_never_deleted(self) -> None:
         outside = Path(tempfile.mkdtemp(prefix="ghosttrace-linked-"))
@@ -507,6 +586,7 @@ class ServerTests(unittest.TestCase):
             (outside / "crm.csv").write_text("email,name\nlinked@example.com,L\n", encoding="utf-8")
             status, _, data = self.call("POST", "/api/folders", json.dumps({"path": str(outside)}).encode())
             self.assertEqual(status, 200)
+            self.wait(json.loads(data)["job"])
             names = {s["name"]: s for s in json.loads(self.call("GET", "/api/sources")[2])}
             name = f"{outside.name}/crm.csv"
             self.assertTrue(names[name]["linked"])
