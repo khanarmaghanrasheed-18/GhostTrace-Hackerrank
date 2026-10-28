@@ -523,7 +523,7 @@ class ServerTests(unittest.TestCase):
         self.assertIn("default-src 'self'", headers["Content-Security-Policy"])
         self.assertNotIn(b"http://", body.replace(b"http://www.w3.org", b""))
         self.assertEqual(self.call("GET", "/api/status", host="attacker.example")[0], 403)
-        refused = self.call("POST", "/api/settings", b"{}", origin="https://attacker.example")
+        refused = self.call("POST", "/api/reread", b"{}", origin="https://attacker.example")
         self.assertEqual(refused[0], 403)                                   # no requests from other sites
         self.assertEqual(self.call("GET", "/app.js")[0], 200)
         self.assertEqual(self.call("GET", "/../server.py")[0], 404)
@@ -579,6 +579,7 @@ class ServerTests(unittest.TestCase):
         status = json.loads(self.call("GET", "/api/status")[2])
         self.assertGreaterEqual(status["sources"], 12)
         self.assertTrue(status["ready"])
+        self.assertEqual({t["command"] for t in status["tools"]}, {"tesseract", "pdftotext", "pdftoppm"})
 
     def test_linked_folder_is_read_in_place_and_never_deleted(self) -> None:
         outside = Path(tempfile.mkdtemp(prefix="ghosttrace-linked-"))

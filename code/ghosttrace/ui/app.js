@@ -10,7 +10,6 @@ import {historyPage} from "./history.js";
 import {batchPage} from "./batch.js";
 import {policyPage} from "./policy.js";
 import {settingsPage} from "./settings.js";
-import {benchmarkPage, benchmarkCase} from "./benchmark.js";
 
 const NAV = [
   ["Overview", [["#/home", "Home", "home"]]],
@@ -23,7 +22,6 @@ const ROUTES = [
   [/^#\/home$/, homePage], [/^#\/sources$/, sourcesPage], [/^#\/check(?:\?(.*))?$/, checkPage],
   [/^#\/result\/([\w-]+)(?:\/(\w+))?$/, resultPage], [/^#\/results$/, historyPage],
   [/^#\/batch(?:\/([\w-]+))?$/, batchPage], [/^#\/policy$/, policyPage], [/^#\/settings$/, settingsPage],
-  [/^#\/benchmark$/, benchmarkPage], [/^#\/benchmark\/(case_\d+)$/, benchmarkCase],
 ];
 
 // -- theme --------------------------------------------------------------------
@@ -49,7 +47,6 @@ const sidebar = h("nav", {class: "sidebar", "aria-label": "Main"}, [
       navCounts[href] = count;
       return h("a", {class: "navlink", href}, [icon(iconName), label, count]);
     })])),
-  h("div", {class: "navgroup", id: "benchmark-nav"}),
   h("div", {class: "sidebar-foot"}, [h("div", {id: "privacy"}),
     h("div", {class: "footlinks"}, [
       h("button", {class: "iconbtn", type: "button", title: "Switch light or dark", "aria-label": "Switch light or dark", onclick: cycleTheme}, [icon("moon")]),
@@ -72,9 +69,8 @@ function cycleTheme() {
 }
 
 function paintStatus(status) {
-  const ai = status.ai.allowed && status.ai.key_configured;
-  clear(document.getElementById("privacy"), h("div", {class: `privacy ${ai ? "warn" : "good"}`}, [icon(ai ? "sparkle" : "lock", "sm"),
-    h("span", {text: ai ? "AI helper on: what-if questions and short excerpts go to Gemini." : "Local only. No data leaves this computer."})]));
+  clear(document.getElementById("privacy"), h("div", {class: "privacy good"}, [icon("lock", "sm"),
+    h("span", {text: "Local only. No data leaves this computer."})]));
   navCounts["#/sources"].textContent = status.sources ? n(status.sources) : "";
   navCounts["#/results"].textContent = status.checks ? n(status.checks) : "";
   const reading = status.reading;
@@ -84,10 +80,6 @@ function paintStatus(status) {
     clear(jobchip, h("span", {class: "spinner"}),
       p.file && p.reading ? `Reading ${p.file.split("/").pop()} · ${n(p.records)} records` :
         `Reading files ${n(p.files_done || 0)} of ${n(p.files_total || 0)}`);
-  }
-  const bench = document.getElementById("benchmark-nav");
-  if (status.benchmark_available && !bench.childElementCount) {
-    bench.append(h("span", {text: "Lab"}), h("a", {class: "navlink", href: "#/benchmark"}, [icon("flask"), "Benchmark"]));
   }
 }
 

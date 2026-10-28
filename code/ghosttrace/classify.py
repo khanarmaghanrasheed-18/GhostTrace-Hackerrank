@@ -1,8 +1,8 @@
 """Decide what kind of data a record holds and what state it is in.
 
 The category drives the policy rule. It comes from, in order: an explicit
-record_type field, a user's choice for the whole source, a resource ID prefix,
-and finally keywords in the source, sheet or table name and column names. The
+record_type field, a user's choice for the whole source, an opt-in field, and
+finally keywords in the source, sheet or table name and column names. The
 first keyword list that matches wins, so specific kinds come before general ones.
 """
 
@@ -13,7 +13,6 @@ from pathlib import Path
 import re
 from typing import Any
 
-from .ingest import RESOURCE, default_category
 
 POLICY_FILE = Path(__file__).parent / "policy" / "default_policy.csv"
 
@@ -91,9 +90,6 @@ def category_for(record: Any, source_category: str = "") -> tuple[str, str]:
         return stated, "record_type field"
     if source_category:
         return source_category, "chosen for the whole source"
-    resource = fields.get("resource_id", "")
-    if RESOURCE.fullmatch(resource) and default_category(resource):
-        return default_category(resource), f"resource ID prefix of {resource}"
     if fields.get("email_opt_in") or fields.get("marketing_opt_in"):
         return "MARKETING_PROFILE", "opt-in field"
     lowered = {k.lower() for k in fields}

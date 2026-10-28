@@ -1,38 +1,36 @@
 # GhostTrace
 
-**Is that person's data really deleted?** GhostTrace is a local agent that answers that question for any pile of company data:
+**Is that person's data really deleted?** GhostTrace answers that question for a company's own data, on the company's own computer.
 
-- spreadsheets and database exports;
-- screenshots and scanned PDFs;
-- logs, support exports, Word letters and email files.
-
-Give it the files and the person's email, phone, name or ID. It tells you:
+Give it database files, exports, spreadsheets, screenshots, PDFs, emails and logs. Then name a person by email, phone, name or ID. It tells you:
 
 - **whether their data still exists**, and the exact file, sheet, table, row, page or log line where it remains;
 - **why** it counts: which identifier matched, how GhostTrace knows that identifier belongs to the person, and which policy rule applies;
 - **what can bring it back**: active syncs and integrations, and restorable backups;
 - **how to finish the job**: an ordered cleanup plan that stops processes first, then deletes, redacts or anonymizes, then verifies, while keeping what must be kept (invoices, security logs, legal holds);
-- **what a cleanup idea would achieve** before anyone touches a system (what-if analysis).
+- **what a cleanup idea would achieve** before anyone touches a system (what-if).
 
-It runs entirely on your computer. Nothing is uploaded and no outside scripts are loaded. Checking files never calls an AI service, so there are no credits or per-file costs; the optional AI helper (for what-if questions only) is off until you turn it on.
-
-It is built for large data: each file is read once, row by row, into a local index, so millions of rows fit on an ordinary computer.
+Everything runs on your computer. It makes no outside connections at all: no AI service, no analytics, no updates, and nothing is uploaded. It is built for large data: each file is read once, row by row, into a local index, so millions of rows fit on an ordinary computer.
 
 ---
 
-## Quick start
+## Install
 
-You need Python 3.10 or newer; GhostTrace uses only Python's standard library. To read PDFs and screenshots, also install two free command-line tools:
+1. **Python 3.10 or newer.** GhostTrace uses only Python's standard library, so there is nothing else to install with pip.
+   - Windows: install from [python.org](https://www.python.org/downloads/) and tick **Add python.exe to PATH**.
+   - macOS: `brew install python`, or the installer from python.org.
+   - Linux: usually already installed (`python3 --version`).
+2. **Two free tools for PDFs and images** (optional; everything else works without them):
 
-```bash
-# Debian / Ubuntu
-sudo apt-get install -y poppler-utils tesseract-ocr
-# macOS (Homebrew)
-brew install poppler tesseract
-# Windows: install Tesseract (UB Mannheim build) and Poppler, and add both to PATH
-```
+   | System | Command |
+   | --- | --- |
+   | Windows | `winget install --id UB-Mannheim.TesseractOCR -e` and `winget install --id oschwartz10612.Poppler -e`, then add the folders that hold `tesseract.exe` and `pdftotext.exe` to PATH and open a new terminal |
+   | macOS | `brew install tesseract poppler` |
+   | Debian / Ubuntu | `sudo apt-get install -y tesseract-ocr poppler-utils` |
 
-Start the app:
+3. **Check it:** `python code/main.py doctor` lists what is installed and what is missing. The app's **Settings** page shows the same.
+
+## Start
 
 | System | How |
 | --- | --- |
@@ -41,16 +39,9 @@ Start the app:
 | Linux | Run `./start-ghosttrace.sh` |
 | Any | `python3 code/main.py serve --open` (on Windows `py` instead of `python3`) |
 
-Your browser opens **http://127.0.0.1:8765/**. Leave the terminal window open while you use the app; closing it stops GhostTrace.
+Your browser opens **http://127.0.0.1:8765/**. Leave the terminal window open while you use the app; closing it stops GhostTrace. Files, the index and results are kept in the `ghosttrace_workspace` folder next to the app; delete that folder to remove everything GhostTrace stored.
 
-To try it without your own data:
-
-1. On **Home**, click **Try the demo company**.
-2. Check `d.okafor@example.com`.
-
-The demo is a fictional company with 12 files of every kind about one customer.
-
-Your files and results live in `./ghosttrace_workspace/`. Use `--workspace PATH` to keep them somewhere else, and `--port` to change the port.
+To try it without your own data: on **Home**, click **Try the demo company**, then check `d.okafor@example.com`. The demo is a fictional company with 12 files of every kind about one customer.
 
 ### Large data
 
@@ -82,6 +73,35 @@ Measured with a fictional company database of 5 million rows (four tables, 463 M
 
 A check takes the same few seconds no matter how many people you check in a batch, one after another.
 
+## Testing
+
+**Automated tests** (about 10 seconds):
+
+```bash
+python3 -m unittest discover -s code/tests -p 'test_*.py' -v
+```
+
+They cover every reader, matching and identity links, the index (no record limit, reuse, archives, SQL dumps, text search, shared phones), time and policy rules, form screenshots, the web server (security headers, uploads, background jobs, batches, folders, the report) and the demo company end to end.
+
+**By hand**, with the demo company:
+
+1. Start the app and click **Try the demo company** on Home.
+2. Check `d.okafor@example.com`. Expected: **This person's data still exists**, with 18 copies left, 2 processes that can bring data back, 1 possible match (another Daniel Okafor) and 3 records kept as required (an invoice and two security log rows).
+3. Open a few findings: each shows why it matched, the policy decision and the record itself.
+4. On **What-if**, click *Apply the plan*. Expected: *Deleted*, as a hypothetical.
+5. On **Batch check**, drop `examples/acme_requests.csv`. Expected: 2 still exist, 1 needs review, 1 no trace, 1 not a deletion request.
+6. Check `nobody@example.com`. Expected: **No trace found**.
+
+**With your own data**: add a folder of real exports on **Sources** and check people whose state you already know: someone deleted last month, someone still active, someone who never existed. Compare GhostTrace's answer with what you know.
+
+## Giving it to users
+
+1. Build the release: `python make_release.py`. It runs the tests, stops if any fail, and writes `dist/GhostTrace-<version>.zip` with only what a user needs: the app, the launchers, this README and the demo company. No tests, caches or results are included.
+2. Share the zip however your users get software (a download page, a GitHub release, a shared drive).
+3. Users unzip it anywhere, follow **Install** above, and double-click their launcher. Their data never leaves their computer.
+
+The version number is in `code/ghosttrace/tools.py`; raise it for each release. A user upgrades by unzipping the new version and copying their old `ghosttrace_workspace` folder into it.
+
 ## Using the app
 
 | Page | What you do there |
@@ -93,8 +113,7 @@ A check takes the same few seconds no matter how many people you check in a batc
 | **Batch check** | Drop a CSV of requests (a template is offered). A progress bar runs while each row is checked; every row then opens as its own full result. Earlier batches are kept. |
 | **Sources** | Add a folder to read in place (with a folder browser), upload files, or drop files anywhere on the page. Files are read in the background with live progress. Click a file to preview exactly what was read and to set its capture time, kind of data, store and complete-snapshot flag. |
 | **Deletion policy** | Edit the required action for each kind of data, import or export the rules as CSV, or go back to the default. |
-| **Settings** | Privacy details and the workspace folder, light or dark theme, the opt-in AI helper, and re-reading all files. |
-| **Benchmark** | Explore the bundled Northstar Shop dataset (550 synthetic deletion requests) with the same graph, timeline and what-if tools. |
+| **Settings** | Privacy details and the workspace folder, which reading tools are installed, light or dark theme, and re-reading all files. |
 
 Press **Ctrl K** (⌘K on a Mac) anywhere to jump to a page, open a recent check, or check someone straight away.
 
@@ -119,6 +138,8 @@ Edges are styled by how they are known:
 ## Command line
 
 ```bash
+python3 code/main.py doctor     # is everything installed?
+
 # one person, any files or folders
 python3 code/main.py scan path/to/exports another/file.xlsx --email jane@example.com --id C-1001
 python3 code/main.py scan examples/acme_demo --manifest examples/acme_manifest.csv \
@@ -195,71 +216,35 @@ Files that cannot be read (old binary `.xls`, damaged files, a missing OCR tool)
 
 ## Privacy and security
 
-- The server binds to `127.0.0.1` only, and refuses requests addressed to any other host name (a guard against DNS-rebinding).
-- A strict Content-Security-Policy is sent: no outside scripts, styles, fonts or connections.
+- The server binds to `127.0.0.1` only, and refuses requests addressed to any other host name (a guard against DNS rebinding) or sent from pages on other sites.
+- It makes no outbound connections.
+- A strict Content-Security-Policy is sent: no outside scripts, styles, fonts or connections. The printable report runs no scripts at all.
 - All page text is inserted as text, never as HTML, so file contents cannot run code.
-- Uploaded file names are reduced to plain names, so there is no path traversal.
+- Uploaded file names are reduced to plain names, so there is no path traversal. Files in linked folders are never changed or deleted.
 - Identifiers are not written to the terminal log.
-- **The AI helper (optional):**
-  - It needs both a `GEMINI_API_KEY` environment variable and the switch on the Settings page; it is off by default.
-  - When on, Gemini only turns what-if questions into proposed actions, and code checks every proposal.
-  - Without it, a local rule reader does the same job.
-  - `GEMINI_MAX_CALLS` limits calls (default 20).
 
 ## Project layout
 
 ```text
-code/main.py                  command line: serve, scan, batch-check, and the benchmark commands
+code/main.py                  command line: serve, scan, batch-check, doctor
 code/ghosttrace/readers.py    readers for every supported file type
 code/ghosttrace/store.py      the on-disk index: each file read once, people looked up by identifier
 code/ghosttrace/classify.py   kind of data, state, identifier columns, policy loading
+code/ghosttrace/rules.py      request intent, policy targets, verdict rules, cleanup step order, what-if outcomes
 code/ghosttrace/scanner.py    matching, identity links, findings, verdict, plan, graph, timeline, what-if, batch
-code/ghosttrace/workspace.py  the local workspace (files, linked folders, settings, saved checks and batches, custom policy)
+code/ghosttrace/workspace.py  the local workspace (files, linked folders, saved checks and batches, custom policy)
 code/ghosttrace/jobs.py       background jobs (reading files, batch checks) with progress
 code/ghosttrace/report.py     the printable HTML report of a check
+code/ghosttrace/tools.py      the version, and the check for Tesseract and Poppler
 code/ghosttrace/server.py     local web server and JSON API
-code/ghosttrace/ui/           the app: plain HTML, CSS and JavaScript modules, no build step and nothing loaded from outside
+code/ghosttrace/policy/       the default deletion policy
+code/ghosttrace/ui/           the app: plain HTML, CSS and JavaScript modules, no build step, nothing loaded from outside
+code/tests/                   the tests
+examples/                     the fictional Acme Outdoor demo, its capture times and a batch request file
+make_release.py               builds the zip for users
 Start GhostTrace.bat, start-ghosttrace.command, start-ghosttrace.sh
                               double-click launchers
-code/ghosttrace/ingest.py, identity.py, engine.py, graph.py, views.py, whatif.py
-                              the benchmark audit engine for the Northstar dataset
-code/evaluation/              tests (76) and the benchmark evaluator
-examples/                     fictional Acme Outdoor demo, its manifest and a batch request file
-docs/PLAN.md                  architecture decisions and status
 ```
-
-Run the tests with:
-
-```bash
-python3 -m unittest discover -s code/evaluation -p 'test_*.py' -v
-```
-
-## Benchmark: the Northstar Shop dataset
-
-`dataset/` holds a synthetic deletion-audit benchmark: 550 requests, with 94 evidence files of every kind and hidden answers for 518 of them. The benchmark engine reconstructs each case at its audit time and writes the challenge-format `output.csv`.
-
-```bash
-python3 code/main.py run          # all 518 requests -> output.csv
-python3 code/main.py validate
-python3 code/main.py graph case_29   /   timeline case_29   /   whatif case_29 --add "DISABLE_DATA_FLOW data_flow_3827"
-python3 code/evaluation/main.py   # score on the 32 public samples
-```
-
-On the public samples the engine gets:
-
-- 32/32 statuses right;
-- 21/32 rows exactly right;
-- every predicted step correct (step precision 1.0);
-- 94% of expected steps found (step recall 0.94).
-
-The general `scan` command reaches the same findings from just an email address, for example:
-
-```bash
-python3 code/main.py scan dataset/evidence --manifest dataset/evidence_files.csv \
-        --email noah.f438085@outlook.com --as-of 2026-09-15T12:00:00Z
-```
-
-The original challenge statement is kept in [`problem_statement.md`](./problem_statement.md); the planning conversation behind the architecture is in [`docs/GHOSTTRACE_PLANNING_CONTEXT.md`](./docs/GHOSTTRACE_PLANNING_CONTEXT.md).
 
 ## Limitations
 

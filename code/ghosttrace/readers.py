@@ -37,7 +37,6 @@ from typing import Any
 from xml.etree import ElementTree
 import zipfile
 
-from .ingest import parse_line
 
 MAX_FILE_BYTES = 300 * 1024 * 1024   # only for formats that are parsed whole
 csv.field_size_limit(2 ** 31 - 1)    # very long cells (notes, JSON blobs) are still read
@@ -53,6 +52,7 @@ WHOLE_FILE = {".json", ".xml", ".html", ".htm", ".pdf", ".docx", ".pptx", ".eml"
 TIME_FIELDS = ("updated_at", "modified_at", "last_modified", "observed_at", "captured_at", "recorded_at",
                "event_time", "timestamp", "time", "date", "created_at")
 ISO_TIME = re.compile(r"\d{4}-\d\d-\d\d(?:[T ]\d\d:\d\d(?::\d\d)?)?")
+EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 FORM_FIELD = re.compile(r"^\s*([A-Za-z][A-Za-z0-9 ./#()_-]{0,40}?)\s*[:=]\s*(\S.*?)\s*$")
 # Screens often show a label column without colons: "Customer ID    C-10442".
 FORM_LABEL = re.compile(r"^\s*(email address|e-?mail|phone number|phone|mobile|telephone|customer (?:id|number|no)|"
@@ -475,6 +475,53 @@ def read_lines(source: Source, lines: Any, method: str = "text", place: str = ""
             fields = {k: v for k, v in parsed.items() if v}
         source.add(Record(source.name, f"{place}line {n}", container, fields, text=line,
                           method=method, observed_at=(parsed or {}).get("timestamp", ""), confidence=confidence))
+
+
+# Log lines: JSON lines, key=value, pipe-separated, bracketed, syslog and cloud-function
+# layouts that start with an ISO timestamp are parsed into fields.
+KV = re.compile(r'([A-Za-z_][\w.]*)=(?:\\"((?:[^"\\]|\\[^"])*)\\"|"((?:[^"\\]|\\.)*)"|([^\s"]+))')
+
+
+def parse_line(line: str) -> dict[str, str] | None:
+    """Parse one log line of any of the supplied syntaxes into flat fields."""
+    match = re.match(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\s*(.*)$", line)
+    if not match:
+        return None
+    stamp, rest = match.groups()
+    data: dict[str, str] = {}
+    if rest.startswith("{"):
+        try:
+            data = {k: ("" if v is None else str(v)) for k, v in json.loads(rest).items()}
+        except json.JSONDecodeError:
+            data = {}
+    if not data:
+        if rest.startswith("|"):
+            parts = [p.strip() for p in rest.strip("| ").split("|")]
+            if len(parts) >= 4:
+                data.update(level=parts[0], service=parts[1], trace_id=parts[2], event=parts[3])
+                rest = " ".join(parts[4:])
+        bracket = re.match(r"\[(\w+)\]\s+\[([^\]]+)\]\s+\[([^\]]+)\]\s+(\w+):\s*(.*)", rest)
+        if bracket:
+            data.update(level=bracket.group(1), service=bracket.group(2),
+                        trace_id=bracket.group(3), event=bracket.group(4))
+            rest = bracket.group(5)
+        syslog = re.match(r"<\d+>\d+\s+\S+\s+(\S+)\s+(\S+)\s+-\s+-\s+(.*)", rest)
+        if syslog:
+            data.update(service=syslog.group(1), trace_id=syslog.group(2))
+            rest = syslog.group(3)
+        for key, escaped, quoted, bare in KV.findall(rest):
+            value = escaped or quoted or bare
+            if key == "message" and "=" in value:
+                for k2, e2, q2, b2 in KV.findall(value.replace('\\"', '"')):
+                    data.setdefault(k2, e2 or q2 or b2)
+                continue
+            data.setdefault(key, value)
+        if "function" in data:
+            data.setdefault("service", data["function"])
+        if "requestId" in data:
+            data.setdefault("trace_id", data["requestId"])
+    data["timestamp"] = stamp
+    return data
 
 
 def run_tool(command: list[str], timeout: int = 120) -> str:

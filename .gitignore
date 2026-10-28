@@ -9,3 +9,4 @@ __pycache__/
 *.p12
 *.pfx
 ghosttrace_workspace/
+dist/

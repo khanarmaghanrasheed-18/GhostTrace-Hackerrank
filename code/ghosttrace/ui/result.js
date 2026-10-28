@@ -316,7 +316,6 @@ function whatifPanel(id, items) {
     for (const m of response.messages || []) output.append(notice("warn", "info", `${m.status}: ${m.action} ${m.target || ""} — ${m.reason || m.question || ""}`));
     const interpretation = response.interpretation;
     if (interpretation) {
-      output.append(h("div", {class: "tiny faint", text: `Question read by ${interpretation.interpreter === "local-rules" ? "the built-in rule reader (no AI)" : interpretation.interpreter}`}));
       for (const c of interpretation.clarify) output.append(notice("warn", "help", c.question));
       for (const rj of interpretation.rejected) output.append(notice("bad", "x", `Not possible: ${rj.action} ${rj.target || rj.resource_id || ""} — ${rj.reason}`));
     }

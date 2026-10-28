@@ -29,15 +29,13 @@ from types import SimpleNamespace
 from typing import Any
 import unicodedata
 
-from . import whatif as benchmark_whatif
 from .classify import (CATEGORY_WORDS, belongs_to_subject, category_for, column_kind, identifying_values,
                        load_policy, record_state)
-from .engine import STEP_FOR_TARGET, deletion_intent, judge, order_steps, policy_target
-from .ingest import EMAIL
-from .readers import Record, Source, iso_time, SUPPORTED
+from .readers import EMAIL, Record, Source, iso_time, SUPPORTED
+from .rules import (ACTION_RESULT, ACTIONS, OPERATIONS, STEP_FOR_TARGET, VERBS, deletion_intent, judge, order_steps,
+                    policy_target, treatment_check)
 from .store import (DOCUMENT_METHODS, HEX, OCR_METHODS, PHONE, Store, entity_key, indexed_token, page_of,
                     phone_key)
-from .validate import OPERATIONS
 
 OCR_LINK_CONFIDENCE = 0.8   # identifiers read by OCR below this are only suggested
 MAX_POSSIBLE = 50           # possible matches listed one by one; the rest are counted
@@ -875,9 +873,9 @@ def current_findings(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
 def validate_action(result: dict[str, Any], action: str, target: str | None) -> dict[str, Any]:
     action = (action or "").upper()
     findings = current_findings(result)
-    if action not in benchmark_whatif.ACTION_RESULT:
+    if action not in ACTION_RESULT:
         return {"status": "rejected", "action": action, "target": target,
-                "reason": f"unsupported action; allowed: {', '.join(benchmark_whatif.ACTIONS)}"}
+                "reason": f"unsupported action; allowed: {', '.join(ACTIONS)}"}
     if not target:
         return {"status": "clarify", "action": action, "target": None, "candidates": sorted(findings),
                 "reason": "the proposal does not say which item"}
@@ -899,21 +897,11 @@ def validate_action(result: dict[str, Any], action: str, target: str | None) -> 
     return {"status": "accepted", "action": action, "target": target}
 
 
-def interpret_question(result: dict[str, Any], question: str, gemini: Any = None) -> dict[str, Any]:
-    """Translate a question into checked proposals. Gemini is used only when allowed."""
+def interpret_question(result: dict[str, Any], question: str) -> dict[str, Any]:
+    """Translate a plain-English question into checked proposals, with built-in rules (no AI)."""
     findings = current_findings(result)
-    proposals: list[dict[str, Any]] = []
     interpreter = "local-rules"
-    if gemini is not None and gemini.ready:
-        listing = [{"resource_id": f["id"], "system_id": f["source"], "category": f["category"]}
-                   for f in findings.values()]
-        answer = gemini.propose_actions(question, listing, benchmark_whatif.ACTIONS)
-        if isinstance(answer, dict) and isinstance(answer.get("actions"), list):
-            interpreter = f"gemini:{gemini.model}"
-            proposals = [{"action": a.get("action"), "target": a.get("resource_id"),
-                          "candidates": a.get("candidates") or []} for a in answer["actions"] if isinstance(a, dict)]
-    if interpreter == "local-rules":
-        proposals = local_rules(result, question)
+    proposals = local_rules(result, question)
     out: dict[str, Any] = {"interpreter": interpreter, "accepted": [], "clarify": [], "rejected": []}
     for item in proposals:
         if item.get("missing"):
@@ -943,7 +931,7 @@ def local_rules(result: dict[str, Any], question: str) -> list[dict[str, Any]]:
     proposals = []
     action = ""
     for clause in re.split(r"\s*(?:,|;|\band then\b|\bthen\b|\band\b|\balso\b|\bplus\b)\s*", question, flags=re.I):
-        for pattern, verb in benchmark_whatif.VERBS:
+        for pattern, verb in VERBS:
             if re.search(pattern, clause, re.I):
                 action = verb
                 break
@@ -980,14 +968,14 @@ def local_rules(result: dict[str, Any], question: str) -> list[dict[str, Any]]:
 
 def whatif_assess(result: dict[str, Any], actions: list[dict[str, str]]) -> dict[str, Any]:
     findings = current_findings(result)
-    applied = {a["target"]: benchmark_whatif.ACTION_RESULT[a["action"]] for a in actions}
+    applied = {a["target"]: ACTION_RESULT[a["action"]] for a in actions}
     outcome: dict[str, list[dict[str, str]]] = {"resolved": [], "still required": [], "policy conflict": [],
                                                  "compliant already": [], "needs review": []}
     for fid, finding in sorted(findings.items(), key=lambda kv: int(kv[0][1:])):
         entry = {"id": fid, "where": f"{finding['source']} / {finding['location']}", "category": finding["category"],
                  "rule_id": finding["rule_id"], "policy": finding["policy"], "required": finding["required_state"]}
         if fid in applied:
-            status, reason = benchmark_whatif.treatment_check(finding["required_state"], applied[fid])
+            status, reason = treatment_check(finding["required_state"], applied[fid])
             outcome[status].append({**entry, "reason": reason})
         elif finding["verdict"] == "violation":
             outcome["still required"].append({**entry, "reason": "still non-compliant; no proposed action treats it"})

@@ -2,10 +2,9 @@
 
 It listens on 127.0.0.1 only. It refuses requests addressed to any other host name
 (so other web pages cannot reach it through DNS rebinding) and requests sent from
-pages on other sites. The page loads no outside scripts, fonts or images. Files,
-results and settings stay in the workspace folder. The only outbound call it can
-make is to Gemini, and only after the user turns the AI helper on and a
-GEMINI_API_KEY is set.
+pages on other sites. The page loads no outside scripts, fonts or images, and the
+server makes no outbound calls at all. Files, results and settings stay in the
+workspace folder.
 
 Reading files into the index and batch checks run as background jobs; the page
 shows their progress.
@@ -24,9 +23,8 @@ import traceback
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import report, scanner, whatif
+from . import report, scanner, tools
 from .classify import CATEGORIES
-from .gemini import GeminiInterpreter
 from .jobs import Jobs
 from .readers import SUPPORTED
 from .workspace import Workspace
@@ -45,15 +43,8 @@ class App:
     def __init__(self, workspace: Workspace, repo_root: Path):
         self.workspace = workspace
         self.repo_root = repo_root
-        self.gemini = GeminiInterpreter(workspace.root)
         self.jobs = Jobs()
         self.read_again = False
-        self._engine = None
-        self._benchmark_rows: list[dict[str, Any]] | None = None
-
-    def ai(self) -> Any:
-        """The Gemini helper, only when the user allowed it and a key is configured."""
-        return self.gemini if self.workspace.settings().get("ai_allowed") and self.gemini.ready else None
 
     # -- reading files ---------------------------------------------------------
 
@@ -111,14 +102,11 @@ class App:
                 "records": sum(s["records"] for s in sources),
                 "unreadable": sum(1 for s in sources if not s["readable"]), "checks": len(checks),
                 "checks_by_status": by_status, "recent_checks": checks[:12], "batches": len(ws.list_batches()),
-                "reading": self.reading(),
+                "reading": self.reading(), "tools": tools.status(), "version": tools.VERSION,
                 "ready": ws.ready() and not ws.busy() and not self.jobs.running("index")
                 and not any(s["status"] == "waiting" for s in sources),
-                "ai": {"key_configured": self.gemini.ready, "allowed": bool(ws.settings().get("ai_allowed")),
-                       "usage": self.gemini.usage()},
                 "supported": sorted(SUPPORTED), "categories": CATEGORIES,
-                "demo_available": all((self.repo_root / p).exists() for p in DEMO_FILES),
-                "benchmark_available": (self.repo_root / "dataset" / "evidence_files.csv").is_file()}
+                "demo_available": all((self.repo_root / p).exists() for p in DEMO_FILES)}
 
     def check(self, body: dict[str, Any]) -> dict[str, Any]:
         lists = {k: [str(v).strip() for v in body.get(k, []) if str(v).strip()] for k in ("emails", "phones", "names", "ids")}
@@ -164,7 +152,7 @@ class App:
             (actions if check["status"] == "accepted" else messages).append(check)
         interpretation = None
         if body.get("question"):
-            interpretation = scanner.interpret_question(result, body["question"], self.ai())
+            interpretation = scanner.interpret_question(result, body["question"])
             for item in interpretation["accepted"]:
                 actions = [a for a in actions if a["target"] != item["target"]] + [item]
         clean = [{"action": a["action"], "target": a["target"]} for a in actions]
@@ -193,66 +181,6 @@ class App:
                 self.workspace.copy_source(path)
         self.workspace.import_manifest(manifest.read_bytes())
         return self.start_reading()
-
-    # -- the benchmark -----------------------------------------------------------
-
-    def engine(self) -> Any:
-        if self._engine is None:
-            from .engine import AuditEngine
-            self._engine = AuditEngine(self.repo_root, use_gemini=False)
-        return self._engine
-
-    def benchmark_requests(self) -> dict[str, dict[str, str]]:
-        from .ingest import read_csv
-        rows = {}
-        for name, sample in (("sample_deletion_requests.csv", True), ("deletion_requests.csv", False)):
-            for row in read_csv(self.repo_root / "dataset" / name):
-                rows[row["case_id"]] = {**row, "sample": sample}
-        return rows
-
-    def benchmark_list(self) -> list[dict[str, Any]]:
-        if self._benchmark_rows is None:
-            engine = self.engine()
-            rows = []
-            for case_id, request in sorted(self.benchmark_requests().items(), key=lambda kv: int(kv[0].split("_")[1])):
-                row, detail = engine.investigate(request)
-                rows.append({"case_id": case_id, "sample": request["sample"], "email": request["email"],
-                             "reported_status": request["reported_status"], "audit_at": request["audit_at"],
-                             "status": row["deletion_status"], "steps": len(json.loads(row["steps_json"])),
-                             "person": detail.get("user_id")})
-            self._benchmark_rows = rows
-        return self._benchmark_rows
-
-    def benchmark_case(self, case_id: str) -> dict[str, Any]:
-        from .views import case_graph, case_timeline, graph_for_ui
-        request = self.benchmark_requests().get(case_id)
-        if not request:
-            raise ValueError("unknown benchmark case")
-        engine = self.engine()
-        row, detail = engine.investigate(request)
-        view = case_graph(engine, request)
-        return {"request": request, "status": row["deletion_status"], "steps": json.loads(row["steps_json"]),
-                "intent": detail.get("intent"), "graph": graph_for_ui(engine, view), "view": view,
-                "timeline": case_timeline(engine, request)}
-
-    def benchmark_whatif(self, case_id: str, body: dict[str, Any]) -> dict[str, Any]:
-        request = self.benchmark_requests().get(case_id)
-        if not request:
-            raise ValueError("unknown benchmark case")
-        model = whatif.CaseModel(self.engine(), request)
-        actions, messages = [], []
-        for item in body.get("actions", []):
-            check = whatif.validate(model, item.get("action", ""), item.get("target"))
-            (actions if check["status"] == "accepted" else messages).append(check)
-        interpretation = None
-        if body.get("question"):
-            interpretation = whatif.interpret(model, body["question"], self.ai())
-            actions += interpretation["accepted"]
-        actions = whatif.add_actions([], actions)
-        result = whatif.assess(model, actions)
-        return {"actions": [{"action": a["action"], "target": a["resource_id"]} for a in actions],
-                "messages": messages, "interpretation": interpretation, "assessment": result,
-                "explanation": whatif.explain(result)}
 
 
 def browse(path: str) -> dict[str, Any]:
@@ -467,7 +395,7 @@ def make_handler(app: App, port: int) -> type[BaseHTTPRequestHandler]:
                     return self.json(saved) if saved else self.json({"error": "unknown batch"}, 404)
                 if method == "POST" and path == "/api/batches/delete":
                     return self.json({"deleted": ws.delete_batch(self.body_json()["id"])})
-                # -- policy and settings --
+                # -- policy --
                 if method == "GET" and path == "/api/policy":
                     return self.json({"rules": ws.policy(), "custom": ws.policy_file() is not None,
                                       "default": [r for _, r in sorted(scanner.load_policy(None).items())]})
@@ -479,15 +407,6 @@ def make_handler(app: App, port: int) -> type[BaseHTTPRequestHandler]:
                 if method == "POST" and path == "/api/policy/reset":
                     ws.reset_policy()
                     return self.json({"rules": ws.policy(), "custom": False})
-                if method == "POST" and path == "/api/settings":
-                    return self.json(ws.save_settings(self.body_json()))
-                # -- the benchmark --
-                if method == "GET" and path == "/api/benchmark":
-                    return self.json(app.benchmark_list())
-                if method == "GET" and path.startswith("/api/benchmark/"):
-                    return self.json(app.benchmark_case(path.split("/")[3]))
-                if method == "POST" and path.startswith("/api/benchmark/") and path.endswith("/whatif"):
-                    return self.json(app.benchmark_whatif(path.split("/")[3], self.body_json()))
                 return self.json({"error": "not found"}, 404)
             except (ValueError, KeyError, json.JSONDecodeError) as exc:
                 return self.json({"error": str(exc).strip("'\"")}, 400)
@@ -504,7 +423,10 @@ def serve(workspace: Workspace, repo_root: Path, port: int = 8765, open_browser:
     url = f"http://127.0.0.1:{port}/"
     print(f"GhostTrace is running locally at {url}")
     print(f"Workspace: {workspace.root}")
-    print("Nothing is sent anywhere unless you turn on the AI helper. Press Ctrl+C to stop.")
+    print("Nothing is sent anywhere. Press Ctrl+C to stop.")
+    missing = [t for t in tools.status() if not t["found"]]
+    if missing:
+        print("Not installed, so some files cannot be read: " + "; ".join(f"{t['name']} ({t['needed_for']})" for t in missing))
     if workspace.file_count():
         print("Reading new or changed files into the local index; the page shows the progress.")
     app.start_reading()

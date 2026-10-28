@@ -7,7 +7,6 @@ Layout:
   <workspace>/checks/         saved check results (JSON)
   <workspace>/batches/        saved batch results (JSON)
   <workspace>/policy.csv      optional custom deletion policy
-  <workspace>/settings.json   local settings, e.g. whether the AI helper is allowed
   <workspace>/.cache/         the index of every record (index.sqlite)
 Everything stays on this machine.
 """
@@ -391,14 +390,3 @@ class Workspace:
     def policy(self) -> list[dict[str, str]]:
         rules = load_policy(self.policy_file())
         return [rules[k] for k in sorted(rules)]
-
-    def settings(self) -> dict[str, Any]:
-        path = self.root / "settings.json"
-        return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {"ai_allowed": False}
-
-    def save_settings(self, changes: dict[str, Any]) -> dict[str, Any]:
-        settings = self.settings()
-        if "ai_allowed" in changes:
-            settings["ai_allowed"] = bool(changes["ai_allowed"])
-        (self.root / "settings.json").write_text(json.dumps(settings, indent=2), encoding="utf-8")
-        return settings

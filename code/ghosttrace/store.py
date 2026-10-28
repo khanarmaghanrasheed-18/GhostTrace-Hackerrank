@@ -30,8 +30,7 @@ from typing import Any, Callable
 import unicodedata
 
 from .classify import column_kind
-from .ingest import EMAIL
-from .readers import Record, Source, file_time, kind_of, read_into
+from .readers import EMAIL, Record, Source, file_time, kind_of, read_into
 
 PHONE = re.compile(r"\+?\d[\d\s().\-]{6,}\d")
 HEX = re.compile(r"\b(?:[0-9a-f]{64}|[0-9a-f]{40}|[0-9a-f]{32})\b", re.I)
@@ -52,7 +51,7 @@ CHUNK = 500           # record IDs fetched per query
 
 # Reading rules: a change to any of these files means every file is read again.
 VERSION = hashlib.sha256(b"".join((Path(__file__).parent / name).read_bytes()
-                                  for name in ("readers.py", "store.py", "classify.py", "ingest.py"))).hexdigest()[:12]
+                                  for name in ("readers.py", "store.py", "classify.py"))).hexdigest()[:12]
 
 LAYOUT = 2   # bumped when the tables change; an index with another layout is rebuilt
 # Records refer to their file by number. page, entity and trace are stored only
